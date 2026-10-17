@@ -2954,7 +2954,19 @@ return function(G)
                 queue:resize(0)
             end
 
-            -- [Port] TODO: PlatformImeData (IME position)
+            -- notify OS of text input position for IME (and, in the port, the selected text for the Roblox text proxy)
+            if not readOnly then
+                local ime = ImGui.GetCurrentContext().PlatformImeData
+                ime.WantVisible = true
+                ime.WantTextInput = true
+                -- at the main cursor: the top left of its line (as in Dear ImGui's InputText)
+                local row, column = self:docPos2VisPos(self:getCursorPosition(cursors:getMainIndex()))
+                ime.InputPos = ImVec2(self.cursorScreenPos.x + self.textLeftOffset + column * self.glyphSize.x - 1, self.cursorScreenPos.y + row * self.glyphSize.y)
+                ime.InputLineHeight = self.glyphSize.y
+                local viewport = ImGui.GetCurrentWindow().Viewport
+                if viewport then ime.ViewportId = viewport.ID end
+                ime.SelectedText = self:GetSelectedText() or ""
+            end
 
             -- tell app to ignore keyboard inputs
             ImGui.SetNextFrameWantCaptureKeyboard(true)
