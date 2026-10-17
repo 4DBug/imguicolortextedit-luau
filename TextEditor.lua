@@ -2943,7 +2943,19 @@ return function(G)
             local queue = io.InputQueueCharacters
             if queue.Size > 0 then
                 -- ignore Ctrl inputs, but need to allow Alt+Ctrl as some keyboards (e.g. German) use AltGR (which is Alt+Ctrl) to input certain characters
-                if not (ImGui.IsKeyDown(Mod_Ctrl) and not ImGui.IsKeyDown(Mod_Alt)) and not readOnly then
+                if readOnly then
+                elseif queue.Size > 1 then
+                    -- [Port] several chars in one frame = a paste delivered as characters (e.g. the Roblox text
+                    -- proxy): insert as one text block, without auto-pairing/auto-indent (else "(x)" became "(x))")
+                    local parts = table.create(queue.Size)
+                    for i = 1, queue.Size do
+                        local character = queue.Data[i]
+                        if character == 10 or character == 9 or character >= 32 then table.insert(parts, utf8.char(character)) end
+                    end
+                    local transaction = self:startTransaction()
+                    self:insertTextIntoAllCursors(transaction, table.concat(parts))
+                    self:endTransaction(transaction)
+                elseif not (ImGui.IsKeyDown(Mod_Ctrl) and not ImGui.IsKeyDown(Mod_Alt)) then
                     for i = 1, queue.Size do
                         local character = queue.Data[i]
                         if character == 10 or character >= 32 then
