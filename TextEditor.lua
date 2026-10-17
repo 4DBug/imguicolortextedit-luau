@@ -7,9 +7,10 @@
 --     glyph `i` (0-based) of a line is `line[i + 1]`. Cursor `c` (0-based) is `cursors.list[c + 1]`.
 --   * Text is UTF-8 encoded Lua strings; glyphs store unicode codepoints.
 --
--- [Port] Only the non-UI data layer is ported so far: Document, Cursor/Cursors, Transactions (undo/redo),
--- text get/set, insert/delete, word boundaries, palettes, languages/colorizer and bracketeer. Rendering, folding,
--- typesetting, markers, squiggles and find/replace are not ported yet.
+-- [Port] Ported: Document, Cursor/Cursors, Transactions (undo/redo), text get/set, insert/delete, word boundaries,
+-- palettes, languages/colorizer, bracketeer, Render (line numbers, selections, text, carets, brackets, markers,
+-- scrolling), keyboard and mouse handling, clipboard. Not ported yet: word wrap/typesetting, folding, minimap,
+-- squiggles, decorations, autocomplete and find/replace (see `[Port] TODO`).
 return function(G)
     local ImGui, ImVec2, ImVec4 = G.ImGui, G.ImVec2, G.ImVec4
     local TextEditor = {}
@@ -1769,13 +1770,37 @@ return function(G)
     -- constructor
     function TextEditor.new()
         local self = setmetatable({}, TextEditor)
-        self.config = { tabSize = 4, insertSpacesOnTabs = false, readOnly = false, showMatchingBrackets = true, language = nil }
+        self.config = {
+            tabSize = 4, insertSpacesOnTabs = false, lineSpacing = 1.0, readOnly = false, caretsVisible = true,
+            autoIndent = true, showSpaces = true, showTabs = true, showLineNumbers = true, showCurrentLineHighlight = true,
+            showMatchingBrackets = true, completePairedGlyphs = true, overwrite = false, leftMargin = 1, textMargin = 2,
+            language = nil,
+        }
         self.document = Document.new()
         self.cursors = Cursors.new()
         self.transactions = Transactions.new()
         self.colorizer = Colorizer.new()
         self.bracketeer = Bracketeer.new()
         self:SetPalette(defaultPalette)
+
+        -- rendering state
+        self.markers = {}
+        self.firstFrame = true
+        self.focusOnEditor = false
+        self.totalSize = ImVec2(0, 0)
+        self.glyphSize = ImVec2(1, 1)
+        self.textSize = ImVec2(0, 0)
+        self.cursorScreenPos = ImVec2(0, 0)
+        self.lineNumberLeftOffset, self.lineNumberRightOffset = 0, 0
+        self.textLeftOffset, self.textRightOffset = 0, 0
+        self.cursorWidth = 1
+        self.navigatingVertically = false
+        self.selectingText = false
+        self.lastClickTime = -1
+        self.completePairCloser = 0
+        self.completePairLocation = newDocPos(0, 0)
+        self.popupDocPos = newDocPos(0, 0)
+        self:resetScrolling()
         return self
     end
 
@@ -1786,7 +1811,9 @@ return function(G)
         self.bracketeer.language = nil
         self.transactions:reset()
         self.cursors:clearAll()
-        -- [Port] markers, squiggles and scrolling not ported yet
+        self:clearMarkers()
+        -- [Port] squiggles not ported yet
+        self:resetScrolling()
     end
 
     -- [Port] normalize helpers accept DocPos or any { line, index } table
@@ -1962,14 +1989,29 @@ return function(G)
     end
 
     -- handle possible changes caused by the API or user interactions
-    -- [Port] called by render upstream; until rendering is ported call it (or GetGlyphColor) to update overlays
+    -- [Port] no folding/typesetter/minimap: a row is a line, the column count is the widest line
     function TextEditor:updateState()
         self.colorizer:update(self.config, self.document)
         self.bracketeer:update(self.config, self.document)
         self.cursors:update(self.document)
         local documentChanged = self.document.updated
+
+        -- [Port] marker/squiggle compression not needed: markers are stored on the line tables
+        -- reset overlay "dirty" flags
         self.document.updated = false
         self.bracketeer:resetUpdated()
+
+        -- get "new" total editor size in pixels
+        -- ponytail: column count rescans every line each call, cache per line if huge documents get slow
+        local columns = 0
+        local tabSize = self.config.tabSize
+        for _, line in ipairs(self.document.lines) do
+            local c = self.lineColumns(line, tabSize)
+            if c > columns then columns = c end
+        end
+        local width = self.textLeftOffset + columns * self.glyphSize.x + self.cursorWidth
+        local height = self.document:size() * self.glyphSize.y
+        self.totalSize = ImVec2(width, height)
         return documentChanged
     end
 
@@ -1990,17 +2032,21 @@ return function(G)
     function TextEditor:moveTo(coordinate, select)
         self.cursors:clearAdditional()
         self.cursors:updateCurrentCursor(coordinate, select and true or false)
+        self:makeCursorVisible()
+        self.navigatingVertically = false
     end
 
     function TextEditor:undo()
         if self.transactions:canUndo() then
             self.transactions:undo(self.config, self.document, self)
+            self:makeCursorVisible()
         end
     end
 
     function TextEditor:redo()
         if self.transactions:canRedo() then
             self.transactions:redo(self.config, self.document, self)
+            self:makeCursorVisible()
         end
     end
 
@@ -2016,6 +2062,7 @@ return function(G)
     end
 
     function TextEditor:setCursor(pos)
+        self.ensureVisiblePos = pos
         self.cursors:setCursor(pos)
     end
 
@@ -2112,6 +2159,1564 @@ return function(G)
         self.cursors:clearAdditional()
         self.cursors:getMain():update(newEnd, newEnd)
         self:endTransaction(transaction)
+    end
+
+    --
+    -- Rendering and user interaction
+    --
+    -- [Port] no word wrap, folding, typesetter, minimap, squiggles, decorations or autocomplete yet:
+    --   a visual row is a document line and a visual column is the sum of glyph widths (tabs expand to tabSize).
+    --   VisPos values are passed as separate (row, column) numbers.
+    --
+
+    do
+        local bor = bit32.bor
+        local Key = G.ImGuiKey
+        local Mod_Ctrl, Mod_Shift, Mod_Alt, Mod_Super = G.ImGuiMod_Ctrl, G.ImGuiMod_Shift, G.ImGuiMod_Alt, G.ImGuiMod_Super
+        local Repeat = G.ImGuiInputFlags.Repeat
+
+        TextEditor.Scroll = { alignTop = 0, alignMiddle = 1, alignBottom = 2 }
+
+        local function glyphColumns(codepoint, column, tabSize)
+            if codepoint == 9 then
+                return tabSize - column % tabSize
+            end
+            return CodePoint.getGlyphWidth(codepoint)
+        end
+
+        function TextEditor.lineColumns(line, tabSize)
+            local column = 0
+            for i = 1, #line do
+                column = column + glyphColumns(line[i].codepoint, column, tabSize)
+            end
+            return column
+        end
+
+        local function isPairOpener(ch) return ch == 123 or ch == 91 or ch == 40 or ch == 39 or ch == 34 end
+        local function toPairCloser(ch)
+            if ch == 123 then return 125 elseif ch == 91 then return 93 elseif ch == 40 then return 41 end
+            return ch
+        end
+
+        -- coordinate conversions
+        function TextEditor:docPos2VisPos(pos)
+            local line = self.document:at(pos.line)
+            local tabSize = self.config.tabSize
+            local column = 0
+            for i = 1, math.min(pos.index, #line) do
+                column = column + glyphColumns(line[i].codepoint, column, tabSize)
+            end
+            return pos.line, column
+        end
+
+        -- [Port] row is clamped to the document (upstream's normalizePos(VisPos)); column snaps to the nearest glyph boundary
+        function TextEditor:visPos2DocPos(row, column)
+            row = math.clamp(row, 0, self.document:size() - 1)
+            local line = self.document:at(row)
+            local tabSize = self.config.tabSize
+            local col, index = 0, 0
+            while index < #line do
+                local width = glyphColumns(line[index + 1].codepoint, col, tabSize)
+                if col + width * 0.5 > column then
+                    break
+                end
+                col = col + width
+                index = index + 1
+            end
+            return newDocPos(row, index)
+        end
+
+        -- [Port] typeSetter.screenPos2DocPos: x/y are in (fractional) glyph units; returns glyphPos, cursorPos
+        function TextEditor:screenPos2DocPos(x, y)
+            local row = math.clamp(math.floor(y), 0, self.document:size() - 1)
+            local line = self.document:at(row)
+            local tabSize = self.config.tabSize
+            local col, index = 0, 0
+            while index < #line do
+                local width = glyphColumns(line[index + 1].codepoint, col, tabSize)
+                if col + width > x then
+                    break
+                end
+                col = col + width
+                index = index + 1
+            end
+            return newDocPos(row, index), self:visPos2DocPos(row, x)
+        end
+
+        function TextEditor:resetCursorAnimationTimer() self.cursorAnimationTimer = -0.3 end
+
+        -- public API (rendering related)
+        -- [Port] Render(title, size?, border?|childFlags?, windowFlags?): a boolean third argument is the classic `border` flag
+        function TextEditor:Render(title, size, childFlags, windowFlags)
+            if childFlags == true then
+                childFlags = G.ImGuiChildFlags.Borders
+            elseif type(childFlags) ~= "number" then
+                childFlags = 0
+            end
+            if windowFlags == nil then
+                windowFlags = bor(G.ImGuiWindowFlags.NoMove, G.ImGuiWindowFlags.HorizontalScrollbar)
+            end
+            return self:render(title, size or ImVec2(0, 0), childFlags, windowFlags)
+        end
+
+        function TextEditor:SetFocus() self.focusOnEditor = true end
+        function TextEditor:ScrollToLine(line, alignment)
+            self:scrollToLine(self:normalizeLine(line), alignment or TextEditor.Scroll.alignMiddle)
+        end
+        function TextEditor:GetFirstVisibleRow() return self.firstVisibleRow end
+        function TextEditor:GetLastVisibleRow() return self.lastVisibleRow end
+        function TextEditor:GetFirstVisibleColumn() return self.firstVisibleColumn end
+        function TextEditor:GetLastVisibleColumn() return self.lastVisibleColumn end
+
+        function TextEditor:SetLineSpacing(value) self.config.lineSpacing = math.max(1.0, math.min(2.0, value)) end
+        function TextEditor:GetLineSpacing() return self.config.lineSpacing end
+        function TextEditor:SetCaretsVisible(value) self.config.caretsVisible = value end
+        function TextEditor:SetAutoIndentEnabled(value) self.config.autoIndent = value end
+        function TextEditor:IsAutoIndentEnabled() return self.config.autoIndent end
+        function TextEditor:SetShowWhitespacesEnabled(value) self.config.showSpaces = value; self.config.showTabs = value end
+        function TextEditor:SetShowSpacesEnabled(value) self.config.showSpaces = value end
+        function TextEditor:SetShowTabsEnabled(value) self.config.showTabs = value end
+        function TextEditor:SetShowLineNumbersEnabled(value) self.config.showLineNumbers = value end
+        function TextEditor:IsShowLineNumbersEnabled() return self.config.showLineNumbers end
+        function TextEditor:SetShowCurrentLineHighlightEnabled(value) self.config.showCurrentLineHighlight = value end
+        function TextEditor:SetCompletePairedGlyphs(value) self.config.completePairedGlyphs = value end
+        function TextEditor:SetOverwriteEnabled(value) self.config.overwrite = value end
+        function TextEditor:IsOverwriteEnabled() return self.config.overwrite end
+        function TextEditor:SetLineNumberLeftMargin(value) self.config.leftMargin = value end
+        function TextEditor:SetTextLeftMargin(value) self.config.textMargin = value end
+
+        function TextEditor:Cut() if not self.config.readOnly then self:cut() end end
+        function TextEditor:Copy() self:copy() end
+        function TextEditor:Paste() if not self.config.readOnly then self:paste() end end
+
+        -- marker support
+        function TextEditor:AddMarker(line, lineNumberColor, textColor, lineNumberTooltip, textTooltip)
+            self:addMarker(self:normalizeLine(line), lineNumberColor, textColor, lineNumberTooltip or "", textTooltip or "")
+        end
+        function TextEditor:ClearMarkers() self:clearMarkers() end
+        function TextEditor:HasMarkers() return #self.markers > 0 end
+
+        -- context menus: callback(popupData) with popupData = { pos = DocPos }
+        function TextEditor:SetLineNumberContextMenuCallback(callback) self.lineNumberContextMenuCallback = callback end
+        function TextEditor:ClearLineNumberContextMenuCallback() self.lineNumberContextMenuCallback = nil end
+        function TextEditor:SetTextContextMenuCallback(callback) self.textContextMenuCallback = callback end
+        function TextEditor:ClearTextContextMenuCallback() self.textContextMenuCallback = nil end
+
+        -- [Port] markers are stored on the line tables, so they follow line inserts/deletes without compressMarkers
+        function TextEditor:addMarker(line, lineNumberColor, textColor, lineNumberTooltip, textTooltip)
+            if line < self.document:size() then
+                local marker = { lineNumberColor = lineNumberColor, textColor = textColor, lineNumberTooltip = lineNumberTooltip, textTooltip = textTooltip }
+                self.markers[#self.markers + 1] = marker
+                self.document:at(line).marker = marker
+            end
+        end
+
+        function TextEditor:clearMarkers()
+            for _, line in ipairs(self.document.lines) do
+                line.marker = nil
+            end
+            self.markers = {}
+        end
+
+        -- update palette with style alpha
+        function TextEditor:updatePalettes()
+            local alpha = ImGui.GetStyle().Alpha
+            self.paletteAlpha = alpha
+            self.paletteSource = self.paletteBase
+            local palette = {}
+            for i, color in ipairs(self.paletteBase) do
+                local a = math.floor(bit32.rshift(color, 24) * alpha + 0.5)
+                palette[i] = bor(bit32.band(color, 0x00FFFFFF), bit32.lshift(a, 24))
+            end
+            self.palette = palette
+        end
+
+        --
+        -- TextEditor::render
+        --
+
+        function TextEditor:render(title, size, childFlags, windowFlags)
+            -- track content state changes
+            local documentChanged = false
+
+            -- special handling for first frame as we can't use SetNextWindowFocus during it
+            if not self.firstFrame then
+                -- ensure editor has focus (if required)
+                if self.focusOnEditor then
+                    ImGui.SetNextWindowFocus()
+                    self.focusOnEditor = false
+                end
+            else
+                self.firstFrame = false
+            end
+
+            -- update color palette (if required)
+            -- [Port] done before BeginChild so the background color uses the current palette
+            local style = ImGui.GetStyle()
+            if self.palette == nil or self.paletteAlpha ~= style.Alpha or self.paletteSource ~= self.paletteBase then
+                self:updatePalettes()
+            end
+            local palette = self.palette
+
+            -- start a new child window
+            ImGui.SetNextWindowContentSize(self.totalSize)
+            ImGui.PushStyleVar(G.ImGuiStyleVar.ItemSpacing, ImVec2(0.0, 0.0))
+            ImGui.PushStyleColor(G.ImGuiCol.ChildBg, ImGui.ColorConvertU32ToFloat4(palette[Color.background]))
+
+            if ImGui.BeginChild(title, size, childFlags, windowFlags) then
+                -- perform last part of scrolling reset here (as it requires the correct Dear ImGui context)
+                if self.resetDearImGuiScrolling then
+                    ImGui.SetScrollX(0.0)
+                    ImGui.SetScrollY(0.0)
+                    self.resetDearImGuiScrolling = false
+                end
+
+                -- get drawList
+                self.drawList = ImGui.GetWindowDrawList()
+
+                -- get font information
+                self.font = ImGui.GetFont()
+                self.fontSize = ImGui.GetFontSize()
+                local fontScaleDpi = style.FontScaleDpi or 1.0
+                self.fontScaleDpi = fontScaleDpi
+                self.glyphSize = ImVec2(ImGui.CalcTextSize("#").x, ImGui.GetTextLineHeightWithSpacing() * self.config.lineSpacing)
+                local glyphSize = self.glyphSize
+
+                -- determine current position and visible size
+                self.cursorScreenPos = ImGui.GetCursorScreenPos()
+                local visibleSize = ImGui.GetCurrentWindow().InnerRect:GetSize()
+
+                -- determine horizontal offsets for line numbers, decorations and text
+                if self.config.showLineNumbers then
+                    local digits = math.floor(math.log10(self.document:size() + 1) + 1.0)
+                    self.lineNumberLeftOffset = self.config.leftMargin * glyphSize.x
+                    self.lineNumberRightOffset = self.lineNumberLeftOffset + digits * glyphSize.x
+                else
+                    self.lineNumberLeftOffset = 0.0
+                    self.lineNumberRightOffset = 0.0
+                end
+
+                -- [Port] TODO: line folding indicators and decorations
+                self.textLeftOffset = self.lineNumberRightOffset + self.config.textMargin * glyphSize.x
+
+                -- [Port] TODO: mini map
+                self.textRightOffset = visibleSize.x
+                self.textSize = ImVec2(self.textRightOffset - self.textLeftOffset, visibleSize.y)
+
+                -- handle possible state changes caused by API calls before first frame or between frames
+                self:updateState()
+                self:handlePossibleScrolling()
+
+                -- handle keyboard inputs
+                self:handleKeyboardInputs()
+                documentChanged = self:updateState()
+
+                -- handle mouse inputs
+                self:handleMouseInteractions()
+
+                -- determine visible row/column limits
+                self.firstVisibleRow = math.floor(ImGui.GetScrollY() / glyphSize.y)
+                self.lastVisibleRow = math.min(math.ceil((ImGui.GetScrollY() + self.textSize.y) / glyphSize.y), self.document:size() - 1)
+                self.firstVisibleColumn = math.floor(ImGui.GetScrollX() / glyphSize.x)
+                self.lastVisibleColumn = math.ceil((ImGui.GetScrollX() + self.textSize.x) / glyphSize.x)
+
+                -- determine width of cursor
+                self.cursorWidth = style.InputTextCursorSize or (1.0 * fontScaleDpi)
+
+                -- setup clipping over the text area
+                local drawList = self.drawList
+                local offset = ImGui.GetWindowPos().x
+                drawList:PushClipRect(
+                    ImVec2(offset + self.textLeftOffset - self.cursorWidth, drawList:GetClipRectMin().y),
+                    ImVec2(offset + self.textRightOffset + self.cursorWidth, drawList:GetClipRectMax().y),
+                    true)
+
+                -- render parts in the text area
+                self:renderCurrentLineHighlight()
+                self:renderActiveBracketBackground()
+                self:renderSelections()
+                self:renderTextMarkers()
+                self:renderMatchingBracketLines()
+                -- [Port] TODO: renderSquiggles
+                self:renderText()
+                self:renderCursorCarets()
+
+                -- end clipping
+                drawList:PopClipRect()
+
+                -- render other parts
+                self:renderLineNumberMarkers()
+                self:renderLineNumbers()
+                -- [Port] TODO: renderDecorations, renderFoldIndicators, renderMiniMap, renderScrollbarMiniMap,
+                -- renderPanScrollIndicator, renderFindReplace
+                self:renderPopups()
+
+                -- handle scrolling caused by actions in this frame
+                self:handlePossibleScrolling()
+
+                -- [Port] TODO: navigation cursor hacks (ImGuiConfigFlags_NavEnableKeyboard/Gamepad)
+            end
+
+            ImGui.EndChild()
+            ImGui.PopStyleColor()
+            ImGui.PopStyleVar()
+
+            -- [Port] TODO: delayed change callback
+            return documentChanged
+        end
+
+        --
+        -- TextEditor::renderCurrentLineHighlight
+        --
+
+        function TextEditor:renderCurrentLineHighlight()
+            if self.config.showCurrentLineHighlight and not self.cursors:anyHasSelection() then
+                local alreadyDrawn = {}
+                local glyphSize = self.glyphSize
+                -- [Port] upstream uses textLeftOffset/textRightOffset without the window x offset; anchored to the window here
+                local left = ImGui.GetWindowPos().x + self.textLeftOffset
+                local right = ImGui.GetWindowPos().x + self.textRightOffset
+
+                for _, cursor in ipairs(self.cursors.list) do
+                    local lineNumber = cursor:getInteractiveEnd().line
+                    if not alreadyDrawn[lineNumber] then
+                        alreadyDrawn[lineNumber] = true
+                        local topLeft = ImVec2(left, self.cursorScreenPos.y + lineNumber * glyphSize.y)
+                        local bottomRight = ImVec2(right, topLeft.y + glyphSize.y)
+                        self.drawList:AddRectFilled(topLeft, bottomRight, self.palette[Color.currentLineHighlight])
+                        self.drawList:AddRect(topLeft, bottomRight, self.palette[Color.currentLineHighlightBorder])
+                    end
+                end
+            end
+        end
+
+        --
+        -- TextEditor::renderActiveBracketBackground
+        --
+
+        function TextEditor:renderActiveBracketBackground()
+            if self.config.showMatchingBrackets and #self.bracketeer.list > 0 then
+                -- render active bracket pair
+                local active = self.bracketeer:getEnclosingBrackets(self.cursors:getMain():getInteractiveEnd())
+                if active and active.visible then
+                    local glyphSize = self.glyphSize
+                    for _, pos in ipairs({ active.start, active["end"] }) do
+                        local row, column = self:docPos2VisPos(pos)
+                        if row >= self.firstVisibleRow and row <= self.lastVisibleRow then
+                            local x = self.cursorScreenPos.x + self.textLeftOffset + column * glyphSize.x
+                            local y = self.cursorScreenPos.y + row * glyphSize.y
+                            self.drawList:AddRectFilled(ImVec2(x, y), ImVec2(x + glyphSize.x, y + glyphSize.y), self.palette[Color.matchingBracketBackground])
+                        end
+                    end
+                end
+            end
+        end
+
+        --
+        -- TextEditor::renderSelections
+        --
+
+        function TextEditor:renderSelections()
+            -- draw background for selections
+            local glyphSize = self.glyphSize
+            for _, cursor in ipairs(self.cursors.list) do
+                if cursor:hasSelection() then
+                    local first = cursor:getSelectionStart()
+                    local last = cursor:getSelectionEnd()
+
+                    for i = math.max(first.line, self.firstVisibleRow), math.min(last.line, self.lastVisibleRow) do
+                        local lineLeft = newDocPos(i, 0)
+                        local lineRight = newDocPos(i, #self.document:at(i))
+                        local docLeft = lineLeft
+                        if first > lineLeft then docLeft = first end
+                        local docRight = lineRight
+                        if last < lineRight then docRight = last end
+                        local _, visLeft = self:docPos2VisPos(docLeft)
+                        local _, visRight = self:docPos2VisPos(docRight)
+
+                        local x = self.cursorScreenPos.x + self.textLeftOffset
+                        local y = self.cursorScreenPos.y + i * glyphSize.y
+                        self.drawList:AddRectFilled(
+                            ImVec2(x + visLeft * glyphSize.x, y),
+                            ImVec2(x + visRight * glyphSize.x, y + glyphSize.y),
+                            self.palette[Color.selection])
+                    end
+                end
+            end
+        end
+
+        --
+        -- TextEditor::renderTextMarkers
+        --
+
+        function TextEditor:renderTextMarkers()
+            if #self.markers > 0 then
+                local glyphSize = self.glyphSize
+                for row = self.firstVisibleRow, self.lastVisibleRow do
+                    local marker = self.document:at(row).marker
+                    if marker and bit32.rshift(marker.textColor, 24) ~= 0 then
+                        local y = self.cursorScreenPos.y + row * glyphSize.y
+                        local left = self.cursorScreenPos.x + self.textLeftOffset
+                        local right = left + self.lastVisibleColumn * glyphSize.x
+                        local s = ImVec2(left, y)
+                        local e = ImVec2(right, y + glyphSize.y)
+                        self.drawList:AddRectFilled(s, e, marker.textColor)
+
+                        if #marker.textTooltip > 0 and ImGui.IsMouseHoveringRect(s, e) then
+                            if ImGui.BeginTooltip() then
+                                ImGui.PushStyleColor(G.ImGuiCol.PopupBg, marker.textColor)
+                                ImGui.TextUnformatted(marker.textTooltip)
+                                ImGui.PopStyleColor()
+                                ImGui.EndTooltip()
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        --
+        -- TextEditor::renderMatchingBracketLines
+        --
+
+        function TextEditor:renderMatchingBracketLines()
+            if self.config.showMatchingBrackets and #self.bracketeer.list > 0 then
+                local active = self.bracketeer:getEnclosingBrackets(self.cursors:getMain():getInteractiveEnd())
+                local glyphSize = self.glyphSize
+
+                -- render bracket pair lines
+                for _, bracket in ipairs(self.bracketeer.list) do
+                    if bracket.visible and bracket["end"].line - bracket.start.line > 1 then
+                        local _, startColumn = self:docPos2VisPos(bracket.start)
+                        local _, endColumn = self:docPos2VisPos(bracket["end"])
+                        local lineX = self.cursorScreenPos.x + self.textLeftOffset + math.min(startColumn, endColumn) * glyphSize.x
+                        local startY = self.cursorScreenPos.y + (bracket.start.line + 1) * glyphSize.y
+                        local endY = self.cursorScreenPos.y + bracket["end"].line * glyphSize.y
+                        local color = Color.whitespace
+                        if bracket == active then color = Color.matchingBracketActive end
+                        -- [Port] one line per bracket pair instead of one per document line
+                        self.drawList:AddLine(ImVec2(lineX, startY), ImVec2(lineX, endY), self.palette[color])
+                    end
+                end
+            end
+        end
+
+        --
+        -- TextEditor::renderText
+        --
+
+        function TextEditor:renderText()
+            local glyphSize = self.glyphSize
+            local tabSize = self.config.tabSize
+            local fontSize = self.fontSize
+            local palette = self.palette
+            local drawList = self.drawList
+            local font = self.font
+            local whitespace = palette[Color.whitespace]
+            local rowX = self.cursorScreenPos.x + self.textLeftOffset
+            local rowY = self.cursorScreenPos.y + self.firstVisibleRow * glyphSize.y
+            local firstRenderableColumn = math.floor(self.firstVisibleColumn / tabSize) * tabSize
+            local lastVisibleColumn = self.lastVisibleColumn
+
+            -- only process all visible rows
+            for i = self.firstVisibleRow, self.lastVisibleRow do
+                local line = self.document:at(i)
+                local index = 1
+                local column = 0
+
+                -- only process all visible columns
+                while index <= #line and column <= lastVisibleColumn do
+                    local glyph = line[index]
+                    local codepoint = glyph.codepoint
+                    local glyphX = rowX + column * glyphSize.x
+                    local width = glyphColumns(codepoint, column, tabSize)
+
+                    -- handle tabs
+                    if codepoint == 9 then
+                        if self.config.showTabs and column >= firstRenderableColumn then
+                            -- [Port] arrow spans the whole (expanded) tab
+                            local x1 = glyphX + glyphSize.x * 0.3
+                            local y = rowY + fontSize * 0.5
+                            local x2 = glyphX + glyphSize.x * width
+                            drawList:AddLine(ImVec2(x1, y), ImVec2(x2, y), whitespace)
+                            drawList:AddLine(ImVec2(x2, y), ImVec2(x2 - fontSize * 0.16, y - fontSize * 0.16), whitespace)
+                            drawList:AddLine(ImVec2(x2, y), ImVec2(x2 - fontSize * 0.16, y + fontSize * 0.16), whitespace)
+                        end
+
+                    -- handle spaces
+                    elseif codepoint == 32 then
+                        if self.config.showSpaces and column >= firstRenderableColumn then
+                            drawList:AddCircleFilled(ImVec2(glyphX + glyphSize.x * 0.5, rowY + fontSize * 0.5), 1.5, whitespace, 4)
+                        end
+
+                    -- handle regular glyphs
+                    elseif column >= firstRenderableColumn then
+                        font:RenderChar(drawList, fontSize, ImVec2(glyphX, rowY), palette[glyph.color], codepoint)
+                    end
+
+                    column = column + width
+                    index = index + 1
+                end
+
+                rowY = rowY + glyphSize.y
+            end
+        end
+
+        --
+        -- TextEditor::renderCursorCarets
+        --
+
+        function TextEditor:renderCursorCarets()
+            if self.config.caretsVisible and ImGui.IsWindowFocused() then
+                local io = ImGui.GetIO()
+                self.cursorAnimationTimer = self.cursorAnimationTimer + io.DeltaTime
+                local glyphSize = self.glyphSize
+
+                for cursorIndex, cursor in ipairs(self.cursors.list) do
+                    local row, column = self:docPos2VisPos(cursor:getInteractiveEnd())
+
+                    if row >= self.firstVisibleRow and row <= self.lastVisibleRow and column >= self.firstVisibleColumn and column <= self.lastVisibleColumn then
+                        local caretVisible = not io.ConfigInputTextCursorBlink or self.cursorAnimationTimer <= 0.0 or math.fmod(self.cursorAnimationTimer, 1.2) <= 0.8
+                        local x = self.cursorScreenPos.x + self.textLeftOffset + column * glyphSize.x
+                        local y = self.cursorScreenPos.y + row * glyphSize.y
+
+                        -- handle custom caret renderer
+                        if self.customCaretCallback then
+                            self.customCaretCallback({
+                                drawList = self.drawList,
+                                glyphPos = ImVec2(x, y),
+                                glyphSize = glyphSize,
+                                caretVisible = caretVisible,
+                                caretColor = self.palette[Color.cursor],
+                                cursorIndex = cursorIndex - 1,
+                            })
+                        elseif caretVisible then
+                            self.drawList:AddRectFilled(ImVec2(x - self.cursorWidth, y), ImVec2(x, y + glyphSize.y), self.palette[Color.cursor])
+                        end
+                    end
+                end
+            end
+        end
+
+        -- callback(caret) with caret = { drawList, glyphPos, glyphSize, caretVisible, caretColor, cursorIndex }
+        function TextEditor:SetCustomCaretCallback(callback) self.customCaretCallback = callback end
+        function TextEditor:ClearCustomCaretCallback() self.customCaretCallback = nil end
+
+        --
+        -- TextEditor::renderLineNumberMarkers
+        --
+
+        function TextEditor:renderLineNumberMarkers()
+            if #self.markers > 0 then
+                local glyphSize = self.glyphSize
+                -- [Port] anchored to the window x position (like the line numbers) so markers don't scroll horizontally
+                local windowX = ImGui.GetWindowPos().x
+                for row = self.firstVisibleRow, self.lastVisibleRow do
+                    local marker = self.document:at(row).marker
+                    if marker and bit32.rshift(marker.lineNumberColor, 24) ~= 0 then
+                        local y = self.cursorScreenPos.y + row * glyphSize.y
+                        local s = ImVec2(windowX + self.lineNumberLeftOffset, y)
+                        local e = ImVec2(windowX + self.lineNumberRightOffset, y + glyphSize.y)
+                        self.drawList:AddRectFilled(s, e, marker.lineNumberColor)
+
+                        if #marker.lineNumberTooltip > 0 and ImGui.IsMouseHoveringRect(s, e) then
+                            if ImGui.BeginTooltip() then
+                                ImGui.PushStyleColor(G.ImGuiCol.PopupBg, marker.lineNumberColor)
+                                ImGui.TextUnformatted(marker.lineNumberTooltip)
+                                ImGui.PopStyleColor()
+                                ImGui.EndTooltip()
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        --
+        -- TextEditor::renderLineNumbers
+        --
+
+        function TextEditor:renderLineNumbers()
+            if self.config.showLineNumbers then
+                local glyphSize = self.glyphSize
+                local curserLine = self.cursors:getCurrent():getInteractiveEnd().line
+                local positionX = ImGui.GetWindowPos().x
+                local positionY = self.cursorScreenPos.y
+
+                if self.customLineNumberCallback then
+                    local width = self.lineNumberRightOffset - self.lineNumberLeftOffset
+                    for i = self.firstVisibleRow, self.lastVisibleRow do
+                        local color = Color.lineNumber
+                        if i == curserLine then color = Color.currentLineNumber end
+                        local pos = ImVec2(positionX + self.lineNumberLeftOffset, positionY + i * glyphSize.y)
+                        self.customLineNumberCallback({
+                            drawList = self.drawList,
+                            pos = pos,
+                            size = ImVec2(width, glyphSize.y),
+                            digits = math.floor(width / glyphSize.x),
+                            lineNumber = i,
+                            cursorLineNumber = curserLine,
+                            color = self.palette[color],
+                        })
+                    end
+                else
+                    for i = self.firstVisibleRow, self.lastVisibleRow do
+                        local number = tostring(i + 1)
+                        local width = #number * glyphSize.x
+                        local color = Color.lineNumber
+                        if i == curserLine then color = Color.currentLineNumber end
+                        local pos = ImVec2(positionX + self.lineNumberRightOffset - width, positionY + i * glyphSize.y)
+                        self.drawList:AddText(nil, 0.0, pos, self.palette[color], number, 1, #number + 1)
+                    end
+                end
+            end
+        end
+
+        -- callback(data) with data = { drawList, pos, size, digits, lineNumber, cursorLineNumber, color }
+        function TextEditor:SetCustomLineNumberCallback(callback) self.customLineNumberCallback = callback end
+        function TextEditor:ClearCustomLineNumberCallback() self.customLineNumberCallback = nil end
+
+        --
+        -- TextEditor::renderPopups
+        --
+        -- [Port] TODO: TextHoverPopup and autocomplete popup
+
+        function TextEditor:renderPopups()
+            local popupData = { pos = self.popupDocPos }
+
+            if ImGui.BeginPopup("LineNumberContextMenu") then
+                if self.lineNumberContextMenuCallback then
+                    self.lineNumberContextMenuCallback(popupData)
+                else
+                    ImGui.CloseCurrentPopup()
+                end
+                ImGui.EndPopup()
+            end
+
+            if ImGui.BeginPopup("TextContextMenu") then
+                if self.textContextMenuCallback then
+                    self.textContextMenuCallback(popupData)
+                else
+                    ImGui.CloseCurrentPopup()
+                end
+                ImGui.EndPopup()
+            end
+        end
+
+        --
+        -- TextEditor::handleKeyboardInputs
+        --
+
+        function TextEditor:handleKeyboardInputs()
+            if not ImGui.IsWindowFocused() then
+                return
+            end
+
+            local io = ImGui.GetIO()
+            local macOS = io.ConfigMacOSXBehaviors
+            local readOnly = self.config.readOnly
+            local Shortcut = ImGui.Shortcut
+            local wordMod = Mod_Ctrl
+            local altMod = Mod_Alt
+            if macOS then wordMod = Mod_Alt; altMod = Mod_Super end
+            local pageSize = math.max(self.lastVisibleRow - self.firstVisibleRow - 2, 1)
+            local cursors = self.cursors
+
+            -- cursor movements and selections
+            if Shortcut(Key.UpArrow, Repeat) then self:moveUp(1, false)
+            elseif Shortcut(bor(Mod_Shift, Key.UpArrow), Repeat) then self:moveUp(1, true)
+            elseif Shortcut(Key.DownArrow, Repeat) then self:moveDown(1, false)
+            elseif Shortcut(bor(Mod_Shift, Key.DownArrow), Repeat) then self:moveDown(1, true)
+
+            -- [Port] TODO: shrinkSelections/growSelections (Alt+Shift+Left/Right)
+
+            elseif Shortcut(Key.LeftArrow, Repeat) then self:moveLeft(false, false)
+            elseif Shortcut(bor(Mod_Shift, Key.LeftArrow), Repeat) then self:moveLeft(true, false)
+            elseif Shortcut(bor(wordMod, Key.LeftArrow), Repeat) then self:moveLeft(false, true)
+            elseif Shortcut(bor(wordMod, Mod_Shift, Key.LeftArrow), Repeat) then self:moveLeft(true, true)
+
+            elseif Shortcut(Key.RightArrow, Repeat) then self:moveRight(false, false)
+            elseif Shortcut(bor(Mod_Shift, Key.RightArrow), Repeat) then self:moveRight(true, false)
+            elseif Shortcut(bor(wordMod, Key.RightArrow), Repeat) then self:moveRight(false, true)
+            elseif Shortcut(bor(wordMod, Mod_Shift, Key.RightArrow), Repeat) then self:moveRight(true, true)
+
+            elseif Shortcut(Key.PageUp, Repeat) then self:moveUp(pageSize, false)
+            elseif Shortcut(bor(Mod_Shift, Key.PageUp), Repeat) then self:moveUp(pageSize, true)
+            elseif Shortcut(Key.PageDown, Repeat) then self:moveDown(pageSize, false)
+            elseif Shortcut(bor(Mod_Shift, Key.PageDown), Repeat) then self:moveDown(pageSize, true)
+
+            elseif Shortcut(bor(Mod_Ctrl, Key.UpArrow)) or Shortcut(bor(Mod_Ctrl, Key.Home)) then self:moveTo(self.document:getTop(), false)
+            elseif Shortcut(bor(Mod_Ctrl, Mod_Shift, Key.UpArrow)) or Shortcut(bor(Mod_Ctrl, Mod_Shift, Key.Home)) then self:moveTo(self.document:getTop(), true)
+            elseif Shortcut(bor(Mod_Ctrl, Key.DownArrow)) or Shortcut(bor(Mod_Ctrl, Key.End)) then self:moveTo(self.document:getBottom(), false)
+            elseif Shortcut(bor(Mod_Ctrl, Mod_Shift, Key.DownArrow)) or Shortcut(bor(Mod_Ctrl, Mod_Shift, Key.End)) then self:moveTo(self.document:getBottom(), true)
+
+            elseif Shortcut(Key.Home) then self:moveTo(self.document:getStartOfLine(cursors:getCurrent():getInteractiveEnd()), false)
+            elseif Shortcut(bor(Mod_Shift, Key.Home)) then self:moveTo(self.document:getStartOfLine(cursors:getCurrent():getInteractiveEnd()), true)
+            elseif Shortcut(Key.End) then self:moveTo(self.document:getEndOfLine(cursors:getCurrent():getInteractiveEnd()), false)
+            elseif Shortcut(bor(Mod_Shift, Key.End)) then self:moveTo(self.document:getEndOfLine(cursors:getCurrent():getInteractiveEnd()), true)
+
+            elseif Shortcut(bor(Mod_Ctrl, Key.A)) then self:selectAll()
+            elseif cursors:currentCursorHasSelection() and Shortcut(bor(Mod_Ctrl, Key.D)) then self:addNextOccurrence(false)
+            elseif cursors:currentCursorHasSelection() and Shortcut(bor(Mod_Ctrl, Mod_Alt, Key.D)) then self:addNextOccurrence(true)
+            elseif cursors:currentCursorHasSelection() and Shortcut(bor(Mod_Ctrl, Mod_Alt, Key.L)) then self:addNextOccurrence(true)
+            elseif cursors:currentCursorHasSelection() and Shortcut(bor(Mod_Ctrl, Mod_Shift, Key.D)) then self:selectAllOccurrences(false)
+            elseif cursors:currentCursorHasSelection() and Shortcut(bor(Mod_Ctrl, Mod_Alt, Mod_Shift, Key.D)) then self:selectAllOccurrences(true)
+
+            -- clipboard operations
+            -- [Port] upstream allows cut in read-only mode (copy + no-op delete); guarded here
+            elseif not readOnly and (Shortcut(bor(Mod_Ctrl, Key.X)) or Shortcut(bor(Mod_Ctrl, Key.Delete))) then self:cut()
+            elseif Shortcut(bor(Mod_Ctrl, Key.C)) or Shortcut(bor(Mod_Ctrl, Key.Insert)) then self:copy()
+            elseif not readOnly and (Shortcut(bor(Mod_Ctrl, Key.V), Repeat) or Shortcut(bor(Mod_Shift, Key.Insert), Repeat)) then self:paste()
+
+            elseif not readOnly and Shortcut(bor(Mod_Ctrl, Key.Z), Repeat) then self:undo()
+            elseif not readOnly and Shortcut(bor(Mod_Ctrl, Mod_Shift, Key.Z), Repeat) then self:redo()
+            elseif not readOnly and Shortcut(bor(Mod_Ctrl, Key.Y), Repeat) then self:redo()
+
+            -- remove text
+            elseif not readOnly and Shortcut(Key.Delete, Repeat) then self:handleDelete(false)
+            elseif not readOnly and Shortcut(bor(altMod, Key.Delete), Repeat) then self:handleDelete(true)
+            elseif not readOnly and Shortcut(Key.Backspace, Repeat) then self:handleBackspace(false)
+            elseif not readOnly and Shortcut(bor(altMod, Key.Backspace), Repeat) then self:handleBackspace(true)
+            elseif not readOnly and Shortcut(bor(Mod_Ctrl, Mod_Shift, Key.K)) then self:removeSelectedLines()
+
+            -- text manipulation
+            elseif not readOnly and Shortcut(bor(Mod_Ctrl, Key.LeftBracket), Repeat) then self:deindentLines()
+            elseif not readOnly and Shortcut(bor(Mod_Ctrl, Key.RightBracket), Repeat) then self:indentLines()
+
+            -- [Port] TODO: moveUpLines/moveDownLines (Alt+Up/Down), toggleComments (Ctrl+/ Ctrl+L),
+            -- find/replace (Ctrl+F, Ctrl+Shift+F, Ctrl+G), autocomplete trigger
+
+            -- change insert mode
+            elseif Shortcut(Key.Insert) then self.config.overwrite = not self.config.overwrite
+
+            -- handle new line
+            elseif not readOnly and (Shortcut(Key.Enter, Repeat) or Shortcut(Key.KeypadEnter, Repeat)) then self:handleCharacter(10)
+            elseif not readOnly and (Shortcut(bor(Mod_Ctrl, Key.Enter), Repeat) or Shortcut(bor(Mod_Ctrl, Key.KeypadEnter), Repeat)) then self:insertLineBelow()
+            elseif not readOnly and (Shortcut(bor(Mod_Shift, Key.Enter), Repeat) or Shortcut(bor(Mod_Shift, Key.KeypadEnter), Repeat)) then self:insertLineAbove()
+
+            -- handle tabs
+            elseif not readOnly and Shortcut(Key.Tab, Repeat) then
+                if cursors:anyHasSelection() then
+                    self:indentLines()
+                else
+                    self:handleCharacter(9)
+                end
+            elseif not readOnly and Shortcut(bor(Mod_Shift, Key.Tab), Repeat) then self:deindentLines()
+
+            -- handle escape key
+            elseif cursors:hasMultiple() and Shortcut(Key.Escape) then
+                cursors:clearAdditional()
+            end
+
+            -- handle regular text
+            local queue = io.InputQueueCharacters
+            if queue.Size > 0 then
+                -- ignore Ctrl inputs, but need to allow Alt+Ctrl as some keyboards (e.g. German) use AltGR (which is Alt+Ctrl) to input certain characters
+                if not (ImGui.IsKeyDown(Mod_Ctrl) and not ImGui.IsKeyDown(Mod_Alt)) and not readOnly then
+                    for i = 1, queue.Size do
+                        local character = queue.Data[i]
+                        if character == 10 or character >= 32 then
+                            self:handleCharacter(character)
+                        end
+                    end
+                end
+                queue:resize(0)
+            end
+
+            -- [Port] TODO: PlatformImeData (IME position)
+
+            -- tell app to ignore keyboard inputs
+            ImGui.SetNextFrameWantCaptureKeyboard(true)
+        end
+
+        --
+        -- TextEditor::handleMouseInteractions
+        --
+        -- [Port] TODO: middle mouse panning/scrolling, minimap scrollbar dragging, text hover popup
+
+        function TextEditor:handleMouseInteractions()
+            local io = ImGui.GetIO()
+            local mouse = ImGui.GetMousePos()
+            local windowPos = ImGui.GetWindowPos()
+            local glyphSize = self.glyphSize
+            local mouseX = mouse.x - self.cursorScreenPos.x
+            local mouseY = mouse.y - self.cursorScreenPos.y
+            local absoluteMouseX = mouse.x - windowPos.x
+
+            local overLineNumbers = self.config.showLineNumbers
+                and absoluteMouseX > self.lineNumberLeftOffset
+                and absoluteMouseX < self.lineNumberRightOffset
+
+            local overText = mouseX - ImGui.GetScrollX() > self.textLeftOffset
+                and mouseX - ImGui.GetScrollX() < self.textRightOffset
+                and mouseY - ImGui.GetScrollY() >= 0
+                and mouseY - ImGui.GetScrollY() < self.textSize.y
+
+            local glyphPos, cursorPos = self:screenPos2DocPos((mouseX - self.textLeftOffset) / glyphSize.x, mouseY / glyphSize.y)
+            local cursors = self.cursors
+            local document = self.document
+
+            -- handle left mouse button dragging
+            if ImGui.IsMouseDragging(0) then
+                -- update selection with dragging left mouse button
+                if self.selectingText and overLineNumbers then
+                    local cursor = cursors:getCurrent()
+                    local s = newDocPos(cursorPos.line, 0)
+                    local e = self:normalizePos(newDocPos(cursorPos.line + 1, 0))
+                    if cursor:getInteractiveEnd() < cursor:getInteractiveStart() then
+                        cursor:update(s)
+                    else
+                        cursor:update(e)
+                    end
+                    self:makeCursorVisible()
+
+                elseif self.selectingText and overText then
+                    cursors:updateCurrentCursor(cursorPos)
+                    self:makeCursorVisible()
+                end
+
+            elseif ImGui.IsMouseReleased(0) then
+                self.selectingText = false
+
+            -- ignore other interactions when the editor is not hovered
+            elseif ImGui.IsWindowHovered() then
+                -- show text cursor if required
+                if ImGui.IsWindowFocused() and overText then
+                    ImGui.SetMouseCursor(G.ImGuiMouseCursor.TextInput)
+                end
+
+                if ImGui.IsMouseClicked(1) then
+                    -- handle right clicks by setting up context menu (if required)
+                    if overLineNumbers and self.lineNumberContextMenuCallback then
+                        self.popupDocPos = glyphPos
+                        ImGui.OpenPopup("LineNumberContextMenu")
+                    elseif overText and self.textContextMenuCallback then
+                        self.popupDocPos = glyphPos
+                        ImGui.OpenPopup("TextContextMenu")
+                    end
+
+                elseif ImGui.IsMouseClicked(0) then
+                    -- handle left mouse button actions
+                    self.selectingText = overText or overLineNumbers
+                    local doubleClick = ImGui.IsMouseDoubleClicked(0)
+                    local now = ImGui.GetTime()
+                    local tripleClick = not doubleClick and self.lastClickTime ~= -1 and (now - self.lastClickTime) < io.MouseDoubleClickTime
+                    if tripleClick then
+                        self.lastClickTime = -1
+                    else
+                        self.lastClickTime = now
+                    end
+
+                    if tripleClick then
+                        -- left mouse button triple click
+                        if overText then
+                            local s = document:getStartOfLine(cursorPos)
+                            local e = self:normalizePos(newDocPos(s.line + 1, 0))
+                            cursors:updateCurrentCursor(s, e)
+                        end
+
+                    elseif doubleClick then
+                        -- left mouse button double click
+                        if overText then
+                            local codepoint = document:getCodePoint(glyphPos)
+                            local handled = false
+
+                            -- select bracketed section (if required)
+                            if openers[codepoint] then
+                                local brackets = self.bracketeer:getEnclosingBrackets(document:getRight(glyphPos))
+                                if brackets then
+                                    if ImGui.IsKeyDown(Mod_Shift) then
+                                        cursors:setCursor(brackets.start, document:getRight(brackets["end"]))
+                                    else
+                                        cursors:setCursor(document:getRight(brackets.start), brackets["end"])
+                                    end
+                                    handled = true
+                                end
+
+                            elseif closers[codepoint] then
+                                local brackets = self.bracketeer:getEnclosingBrackets(glyphPos)
+                                if brackets then
+                                    cursors:setCursor(brackets.start, document:getRight(brackets["end"]))
+                                    handled = true
+                                end
+                            end
+
+                            -- select "word" if it wasn't a bracketed section
+                            -- run of whitespaces are considered "words" as are operator sequences
+                            if not handled and not document:isEndOfLine(glyphPos) then
+                                local word = document:getWholeWord(glyphPos)
+                                if word.start ~= word["end"] then
+                                    cursors:updateCurrentCursor(word.start, word["end"])
+                                end
+                            end
+                        end
+
+                    else
+                        -- left mouse button single click
+                        local extendCursor = ImGui.IsKeyDown(Mod_Shift)
+                        local addCursor
+                        if io.ConfigMacOSXBehaviors then
+                            addCursor = ImGui.IsKeyDown(Mod_Alt)
+                        else
+                            addCursor = ImGui.IsKeyDown(Mod_Ctrl)
+                        end
+
+                        if overLineNumbers then
+                            -- handle line number clicks
+                            local s = newDocPos(cursorPos.line, 0)
+                            local e = self:normalizePos(newDocPos(cursorPos.line + 1, 0))
+
+                            if extendCursor then
+                                local cursor = cursors:getCurrent()
+                                if cursor:getInteractiveEnd() < cursor:getInteractiveStart() then
+                                    cursor:update(s)
+                                else
+                                    cursor:update(e)
+                                end
+                            elseif addCursor then
+                                cursors:addCursor(s, e)
+                            else
+                                cursors:setCursor(s, e)
+                            end
+                            self:makeCursorVisible()
+
+                        elseif overText then
+                            -- handle mouse clicks in text
+                            if extendCursor then
+                                cursors:growCurrentCursor(cursorPos)
+                            elseif addCursor then
+                                cursors:addCursor(cursorPos)
+                            else
+                                cursors:setCursor(cursorPos)
+                            end
+                            self:makeCursorVisible()
+                        end
+                    end
+                end
+
+                -- update cursors and reset vertical navigation if any button was pressed
+                if ImGui.IsMouseDown(0) or ImGui.IsMouseDown(1) then
+                    cursors:update(document)
+                    self.navigatingVertically = false
+                end
+            end
+        end
+
+        --
+        -- scrolling
+        --
+
+        function TextEditor:scrollToLine(line, alignment, fraction)
+            self.ensureVisiblePos = nil
+            self.scrollToLineNumber = math.min(line, self.document:size())
+            self.scrollToAlignment = alignment
+            self.scrollToFraction = fraction or 0.0
+        end
+
+        function TextEditor:handlePossibleScrolling()
+            -- apply scrolling (if needed)
+            local scrollX = -1.0
+            local scrollY = -1.0
+            local glyphSize = self.glyphSize
+            local textSize = self.textSize
+
+            -- do we need to make a certain position visible
+            if self.ensureVisiblePos then
+                if self.lastVisibleRow == 0 and self.lastVisibleColumn == 0 then
+                    -- this is a hack to handle a chicken and egg issue when the user called SetCursor before the first frame
+                    self.lastVisibleRow = math.min(math.ceil(textSize.y / glyphSize.y), self.document:size() - 1)
+                    self.lastVisibleColumn = math.ceil(textSize.x / glyphSize.x)
+                end
+
+                local row, column = self:docPos2VisPos(self:normalizePos(self.ensureVisiblePos))
+
+                if row <= self.firstVisibleRow + 1 then
+                    scrollY = math.max(0.0, (row - 2.0) * glyphSize.y)
+                elseif row >= self.lastVisibleRow - 1 then
+                    scrollY = math.max(0.0, (row + 2.0) * glyphSize.y - textSize.y)
+                end
+
+                if column <= self.firstVisibleColumn + 1 then
+                    scrollX = math.max(0.0, (column - 2.0) * glyphSize.x)
+                elseif column >= self.lastVisibleColumn - 1 then
+                    scrollX = math.max(0.0, (column + 2.0) * glyphSize.x - textSize.x)
+                end
+
+                self.ensureVisiblePos = nil
+            end
+
+            -- scroll to specified line (if required)
+            if self.scrollToLineNumber then
+                local row = self.scrollToLineNumber
+                local visibleRows = textSize.y / glyphSize.y
+                scrollX = 0.0
+
+                if self.scrollToAlignment == TextEditor.Scroll.alignTop then
+                    scrollY = (row + self.scrollToFraction) * glyphSize.y
+                elseif self.scrollToAlignment == TextEditor.Scroll.alignMiddle then
+                    scrollY = math.max(0.0, (row - visibleRows / 2.0) * glyphSize.y)
+                else
+                    scrollY = math.max(0.0, (row - (visibleRows - 1.0)) * glyphSize.y)
+                end
+
+                self.scrollToLineNumber = nil
+            end
+
+            -- set scroll (if required)
+            if scrollX >= 0.0 then ImGui.SetScrollX(scrollX) end
+            if scrollY >= 0.0 then ImGui.SetScrollY(scrollY) end
+        end
+
+        function TextEditor:makeCursorVisible()
+            self.ensureVisiblePos = self.cursors:getCurrent():getInteractiveEnd()
+            self.scrollToLineNumber = nil
+            self:resetCursorAnimationTimer()
+        end
+
+        function TextEditor:resetScrolling()
+            -- reset state related parameters
+            self.ensureVisiblePos = nil
+            self.scrollToLineNumber = nil
+            self.firstVisibleRow = 0
+            self.lastVisibleRow = 0
+            self.firstVisibleColumn = 0
+            self.lastVisibleColumn = 0
+            self:resetCursorAnimationTimer()
+
+            -- we can't reset the Dear ImGui scrolling here as we don't necessarily have the right context
+            -- so we just set a flag and the render function will handle it
+            self.resetDearImGuiScrolling = true
+        end
+
+        --
+        -- cursor movements
+        --
+
+        function TextEditor:moveUp(rows, select)
+            -- these must be done with visual coordinates
+            for _, cursor in ipairs(self.cursors.list) do
+                local row, column = self:docPos2VisPos(cursor:getInteractiveEnd())
+                if self.navigatingVertically then
+                    column = cursor.preferredColumn
+                else
+                    cursor.preferredColumn = column
+                end
+                row = math.max(row - rows, 0)
+                cursor:update(self:visPos2DocPos(row, column), select)
+            end
+            self:makeCursorVisible()
+            self.navigatingVertically = true
+        end
+
+        function TextEditor:moveDown(rows, select)
+            for _, cursor in ipairs(self.cursors.list) do
+                local row, column = self:docPos2VisPos(cursor:getInteractiveEnd())
+                if self.navigatingVertically then
+                    column = cursor.preferredColumn
+                else
+                    cursor.preferredColumn = column
+                end
+                cursor:update(self:visPos2DocPos(row + rows, column), select)
+            end
+            self:makeCursorVisible()
+            self.navigatingVertically = true
+        end
+
+        function TextEditor:moveLeft(select, wordMode)
+            for _, cursor in ipairs(self.cursors.list) do
+                if cursor:hasSelection() and not select and not wordMode then
+                    cursor:resetToStart()
+                else
+                    cursor:update(self.document:getLeft(cursor:getInteractiveEnd(), wordMode), select)
+                end
+            end
+            self:makeCursorVisible()
+            self.navigatingVertically = false
+        end
+
+        function TextEditor:moveRight(select, wordMode)
+            for _, cursor in ipairs(self.cursors.list) do
+                if cursor:hasSelection() and not select and not wordMode then
+                    cursor:resetToEnd()
+                else
+                    cursor:update(self.document:getRight(cursor:getInteractiveEnd(), wordMode), select)
+                end
+            end
+            self:makeCursorVisible()
+            self.navigatingVertically = false
+        end
+
+        --
+        -- clipboard
+        --
+
+        function TextEditor:cut()
+            -- copy selections to clipboard and remove them
+            self:copy()
+            local transaction = self:startTransaction()
+            self:deleteTextFromAllCursors(transaction)
+            self.cursors:getCurrent():resetToStart()
+            self:endTransaction(transaction)
+        end
+
+        function TextEditor:copy()
+            -- copy all selections and put them on the clipboard
+            -- empty cursors copy the entire line
+            local parts = {}
+            local document = self.document
+            if self.cursors:anyHasSelection() then
+                for _, cursor in ipairs(self.cursors.list) do
+                    if cursor:hasSelection() then
+                        parts[#parts + 1] = document:getSectionText(cursor:getSelectionStart(), cursor:getSelectionEnd())
+                    else
+                        parts[#parts + 1] = document:getLineText(cursor:getSelectionStart().line)
+                    end
+                end
+                ImGui.SetClipboardText(table.concat(parts, "\n"))
+            else
+                for _, cursor in ipairs(self.cursors.list) do
+                    parts[#parts + 1] = document:getLineText(cursor:getSelectionStart().line) .. "\n"
+                end
+                ImGui.SetClipboardText(table.concat(parts))
+            end
+        end
+
+        function TextEditor:paste()
+            -- ignore non-text clipboard content
+            local clipboard = ImGui.GetClipboardText()
+            if clipboard then
+                local transaction = self:startTransaction()
+                self:insertTextIntoAllCursors(transaction, clipboard)
+                self:endTransaction(transaction)
+            end
+        end
+
+        --
+        -- text editing
+        --
+
+        function TextEditor:handleCharacter(character)
+            local transaction = self:startTransaction()
+            local cursors = self.cursors
+            local document = self.document
+            local config = self.config
+
+            local opener = character
+            local isPaired = not config.overwrite and config.completePairedGlyphs and isPairOpener(opener)
+            local closer = toPairCloser(opener)
+
+            -- ignore input if it was the closing character for a pair that was automatically inserted
+            if self.completePairCloser ~= 0 then
+                if self.completePairCloser == character and self.completePairLocation == cursors:getCurrent():getSelectionEnd() then
+                    self.completePairCloser = 0
+                    self:moveRight(false, false)
+                    return
+                end
+                self.completePairCloser = 0
+            end
+
+            if cursors:anyHasSelection() and isPaired then
+                -- encapsulate the current selections with the requested pairs
+                for c = 0, cursors:size() - 1 do
+                    local cursor = cursors:at(c)
+                    if cursor:hasSelection() then
+                        local s = cursor:getSelectionStart()
+                        local e = cursor:getSelectionEnd()
+
+                        -- insert the closing glyph
+                        local end1 = self:insertText(transaction, e, utf8.char(closer))
+                        cursors:adjustForInsert(c, s, end1)
+
+                        -- insert the opening glyph
+                        local end2 = self:insertText(transaction, s, utf8.char(opener))
+                        cursors:adjustForInsert(c, s, end2)
+
+                        -- update old selection
+                        cursor:update(document:getRight(s), document:getRight(e))
+                    end
+                end
+
+            elseif isPaired then
+                -- insert the requested pair
+                local pair = utf8.char(opener) .. utf8.char(closer)
+                for c = 0, cursors:size() - 1 do
+                    local cursor = cursors:at(c)
+                    local s = cursor:getSelectionStart()
+                    local e = self:insertText(transaction, s, pair)
+                    cursors:adjustForInsert(c, s, e)
+                    cursor:update(document:getRight(s), false)
+                end
+
+                -- remember the closer
+                self.completePairCloser = closer
+                self.completePairLocation = cursors:getCurrent():getSelectionEnd()
+
+            elseif not config.overwrite and config.autoIndent and character == 10 then
+                -- handle auto indent case
+                self:autoIndentAllCursors(transaction)
+
+            else
+                -- handle overwrite by deleting next glyph before insert
+                if config.overwrite then
+                    for c = 0, cursors:size() - 1 do
+                        local cursor = cursors:at(c)
+                        if not cursor:hasSelection() then
+                            local s = cursor:getSelectionStart()
+                            if s ~= document:getEndOfLine(s) then
+                                local e = document:getRight(s)
+                                self:deleteText(transaction, s, e)
+                                cursors:adjustForDelete(c, s, e)
+                            end
+                        end
+                    end
+                end
+
+                -- just insert a regular character
+                self:insertTextIntoAllCursors(transaction, utf8.char(character))
+            end
+
+            self:endTransaction(transaction)
+            -- [Port] upstream relies on autocomplete/typesetter to scroll; make the caret visible after typing
+            self:makeCursorVisible()
+            -- [Port] TODO: autocomplete.startTyping
+        end
+
+        function TextEditor:autoIndentAllCursors(transaction)
+            local cursors = self.cursors
+            local document = self.document
+            for c = 0, cursors:size() - 1 do
+                local cursor = cursors:at(c)
+                local s = cursor:getSelectionStart()
+
+                -- delete any selections
+                if cursor:hasSelection() then
+                    local e = cursor:getSelectionEnd()
+                    self:deleteText(transaction, s, e)
+                    cursors:adjustForDelete(c, s, e)
+                end
+
+                -- get previous and next character
+                local index = s.index
+                local line = document:at(s.line)
+                local previousChar = 0
+                if index > 0 then previousChar = line[index].codepoint end
+                local nextChar = 0
+                if index < #line then nextChar = line[index + 1].codepoint end
+
+                -- remove extra whitespaces if required
+                if CodePoint.isWhiteSpace(nextChar) then
+                    while index < #line and CodePoint.isWhiteSpace(line[index + 1].codepoint) do
+                        index = index + 1
+                    end
+                    local e = newDocPos(s.line, index)
+                    self:deleteText(transaction, s, e)
+                    cursors:adjustForDelete(c, s, e)
+                end
+
+                -- determine whitespace at start of current line
+                local whitespace = {}
+                local i = 1
+                while i <= #line and CodePoint.isWhiteSpace(line[i].codepoint) do
+                    whitespace[#whitespace + 1] = utf8.char(line[i].codepoint)
+                    i = i + 1
+                end
+                local ws = table.concat(whitespace)
+
+                -- determine text to insert
+                local insert = "\n" .. ws
+                local newCursorIndex = #whitespace
+
+                -- handle special cases
+                if previousChar == 123 or previousChar == 91 then
+                    -- add to an existing block
+                    insert = insert .. "\t"
+                    newCursorIndex = newCursorIndex + 1
+                    -- [Port] the tab may expand to spaces (insertSpacesOnTabs)
+                    if self.config.insertSpacesOnTabs then
+                        newCursorIndex = newCursorIndex - 1 + self.config.tabSize - #whitespace % self.config.tabSize
+                    end
+
+                    if (previousChar == 123 and nextChar == 125) or (previousChar == 91 and nextChar == 93) then
+                        -- open a new block
+                        insert = insert .. "\n" .. ws
+                    end
+                end
+
+                -- insert new text
+                local e = self:insertText(transaction, s, insert)
+                cursors:adjustForInsert(c, s, e)
+
+                -- set new cursor location
+                cursor:update(newDocPos(s.line + 1, newCursorIndex), false)
+            end
+        end
+
+        function TextEditor:handleBackspace(wordMode)
+            local transaction = self:startTransaction()
+            local cursors = self.cursors
+
+            -- remove selections or characters to the left of the cursor
+            for c = 0, cursors:size() - 1 do
+                local cursor = cursors:at(c)
+                local s
+                if cursor:hasSelection() then
+                    s = cursor:getSelectionStart()
+                else
+                    s = self.document:getLeft(cursor:getSelectionStart(), wordMode)
+                end
+                local e = cursor:getSelectionEnd()
+                self:deleteText(transaction, s, e)
+                cursor:update(s, false)
+                cursors:adjustForDelete(c, s, e)
+            end
+
+            self:endTransaction(transaction)
+            self:makeCursorVisible()
+        end
+
+        function TextEditor:handleDelete(wordMode)
+            local transaction = self:startTransaction()
+            local cursors = self.cursors
+
+            -- remove selections or characters to the right of the cursor
+            for c = 0, cursors:size() - 1 do
+                local cursor = cursors:at(c)
+                local s = cursor:getSelectionStart()
+                local e
+                if cursor:hasSelection() then
+                    e = cursor:getSelectionEnd()
+                else
+                    e = self.document:getRight(cursor:getSelectionEnd(), wordMode)
+                end
+                self:deleteText(transaction, s, e)
+                cursor:update(s, false)
+                cursors:adjustForDelete(c, s, e)
+            end
+
+            self:endTransaction(transaction)
+            self:makeCursorVisible()
+        end
+
+        function TextEditor:removeSelectedLines()
+            local transaction = self:startTransaction()
+            local cursors = self.cursors
+            for c = 0, cursors:size() - 1 do
+                local cursor = cursors:at(c)
+                local s = self.document:getStartOfLine(cursor:getSelectionStart())
+                local e = cursor:getSelectionEnd()
+                if e.index ~= 0 then e = self.document:getNextLine(e) end
+                self:deleteText(transaction, s, e)
+                cursor:update(s, false)
+                cursors:adjustForDelete(c, s, e)
+            end
+            self:endTransaction(transaction)
+        end
+
+        function TextEditor:insertLineAbove()
+            local transaction = self:startTransaction()
+            local cursors = self.cursors
+            for c = 0, cursors:size() - 1 do
+                local cursor = cursors:at(c)
+                local s = self.document:getStartOfLine(cursor:getSelectionStart())
+                local e = self:insertText(transaction, s, "\n")
+                cursor:update(s, false)
+                cursors:adjustForInsert(c, s, e)
+            end
+            self:endTransaction(transaction)
+        end
+
+        function TextEditor:insertLineBelow()
+            local transaction = self:startTransaction()
+            local cursors = self.cursors
+            for c = 0, cursors:size() - 1 do
+                local cursor = cursors:at(c)
+                local s = cursor:getSelectionEnd()
+                if s.index ~= 0 then s = self.document:getNextLine(s) end
+                local e = self:insertText(transaction, s, "\n")
+                cursor:update(s, false)
+                cursors:adjustForInsert(c, s, e)
+            end
+            self:endTransaction(transaction)
+        end
+
+        function TextEditor:indentLines()
+            local transaction = self:startTransaction()
+            local cursors = self.cursors
+
+            -- process all cursors
+            for c = 0, cursors:size() - 1 do
+                local cursor = cursors:at(c)
+                local cursorStart = cursor:getSelectionStart()
+                local cursorEnd = cursor:getSelectionEnd()
+
+                -- process all lines in this cursor
+                for line = cursorStart.line, cursorEnd.line do
+                    if (not cursor:hasSelection() or newDocPos(line, 0) ~= cursorEnd) and #self.document:at(line) > 0 then
+                        local insertStart = newDocPos(line, 0)
+                        local insertEnd = self:insertText(transaction, insertStart, "\t")
+                        cursors:adjustForInsert(c, insertStart, insertEnd, true)
+                    end
+                end
+            end
+
+            self:endTransaction(transaction)
+        end
+
+        function TextEditor:deindentLines()
+            local transaction = self:startTransaction()
+            local cursors = self.cursors
+
+            -- process all cursors
+            for c = 0, cursors:size() - 1 do
+                local cursor = cursors:at(c)
+                local cursorStart = cursor:getSelectionStart()
+                local cursorEnd = cursor:getSelectionEnd()
+
+                for line = cursorStart.line, cursorEnd.line do
+                    local glyphs = self.document:at(line)
+                    if (not cursor:hasSelection() or newDocPos(line, 0) ~= cursorEnd) and #glyphs > 0 then
+                        -- determine how many whitespaces are available at the start with a max of tabSize columns
+                        local column = 0
+                        local index = 0
+                        while column < self.config.tabSize and index < #glyphs and (glyphs[index + 1].codepoint == 32 or glyphs[index + 1].codepoint == 9) do
+                            column = column + glyphColumns(glyphs[index + 1].codepoint, column, self.config.tabSize)
+                            index = index + 1
+                        end
+
+                        -- delete that whitespace (if required)
+                        local deleteStart = newDocPos(line, 0)
+                        local deleteEnd = newDocPos(line, index)
+                        if deleteEnd ~= deleteStart then
+                            self:deleteText(transaction, deleteStart, deleteEnd)
+                            cursors:adjustForDelete(c, deleteStart, deleteEnd, true)
+                        end
+                    end
+                end
+            end
+
+            self:endTransaction(transaction)
+        end
+
+        --
+        -- occurrences
+        --
+
+        -- [Port] Document::findText: returns start, end (or nil when not found); search wraps around the document
+        function Document:findText(from, text, caseSensitive, wholeWord)
+            local search = CodePoint.decode(text)
+            if #search == 0 then
+                return nil
+            end
+            if not caseSensitive then
+                for j, ch in ipairs(search) do
+                    if ch < 128 then search[j] = string.byte(string.lower(string.char(ch))) end
+                end
+            end
+
+            local function lower(ch)
+                if not caseSensitive and ch < 128 then return string.byte(string.lower(string.char(ch))) end
+                return ch
+            end
+
+            local searchLine = from.line
+            local searchIndex = from.index
+            repeat
+                local line = searchLine
+                local index = searchIndex
+                local lineSize = #self:at(line)
+                local done = false
+                local j = 1
+
+                while not done and j <= #search do
+                    if search[j] == 10 then
+                        if index == lineSize and line ~= #self.lines - 1 then
+                            line = line + 1
+                            index = 0
+                            lineSize = #self:at(line)
+                            j = j + 1
+                        else
+                            done = true
+                        end
+                    elseif index == lineSize then
+                        done = true
+                    elseif lower(self:at(line)[index + 1].codepoint) == search[j] then
+                        index = index + 1
+                        j = j + 1
+                    else
+                        done = true
+                    end
+                end
+
+                if j > #search then
+                    local s = newDocPos(searchLine, searchIndex)
+                    local e = newDocPos(line, index)
+                    if not wholeWord or self:isWholeWord(s, e) then
+                        return s, e
+                    end
+                end
+
+                if searchIndex == #self:at(searchLine) then
+                    if searchLine == #self.lines - 1 then searchLine = 0 else searchLine = searchLine + 1 end
+                    searchIndex = 0
+                else
+                    searchIndex = searchIndex + 1
+                end
+            until searchLine == from.line and searchIndex == from.index
+            return nil
+        end
+
+        function TextEditor:addNextOccurrence(wholeWord)
+            local cursor = self.cursors:getCurrent()
+            local text = self.document:getSectionText(cursor:getSelectionStart(), cursor:getSelectionEnd())
+            local s, e = self.document:findText(cursor:getSelectionEnd(), text, true, wholeWord)
+            if s then
+                self.cursors:addCursor(s, e)
+                -- [Port] merge immediately so wrapping onto an existing cursor doesn't duplicate it
+                self.cursors:update(self.document)
+                self:makeCursorVisible()
+            end
+        end
+
+        function TextEditor:selectAllOccurrencesOf(text, caseSensitive, wholeWord)
+            local document = self.document
+            local s, e = document:findText(newDocPos(0, 0), text, caseSensitive, wholeWord)
+            if s then
+                self.cursors:setCursor(s, e)
+                while true do
+                    local nextStart, nextEnd = document:findText(self.cursors:getCurrent():getSelectionEnd(), text, caseSensitive, wholeWord)
+                    if nextStart == s and nextEnd == e then
+                        break
+                    end
+                    self.cursors:addCursor(nextStart, nextEnd)
+                end
+            else
+                self.cursors:clearAdditional(true)
+            end
+        end
+
+        function TextEditor:selectAllOccurrences(wholeWord)
+            local cursor = self.cursors:getCurrent()
+            local text = self.document:getSectionText(cursor:getSelectionStart(), cursor:getSelectionEnd())
+            self:selectAllOccurrencesOf(text, true, wholeWord)
+        end
+
+        function TextEditor:SelectNextOccurrenceOf(text, caseSensitive, wholeWord)
+            local s, e = self.document:findText(self.cursors:getCurrent():getSelectionEnd(), text, caseSensitive ~= false, wholeWord)
+            if s then
+                self.cursors:setCursor(s, e)
+                self:makeCursorVisible()
+            else
+                self.cursors:clearAdditional(true)
+            end
+        end
+        function TextEditor:SelectAllOccurrencesOf(text, caseSensitive, wholeWord)
+            self:selectAllOccurrencesOf(text, caseSensitive ~= false, wholeWord)
+        end
+        function TextEditor:AddNextOccurrence() self:addNextOccurrence(false) end
+        function TextEditor:SelectAllOccurrences() self:selectAllOccurrences(false) end
+
+        -- [Port] TODO: find/replace window (renderFindReplace, openFindReplace, find/findNext/findAll/replace/replaceAll),
+        -- grow/shrinkSelections, moveUp/DownLines, toggleComments, filters (case, whitespace, tabs/spaces)
     end
 
     return TextEditor
