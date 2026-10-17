@@ -8,16 +8,61 @@
 --   * Text is UTF-8 encoded Lua strings; glyphs store unicode codepoints.
 --
 -- [Port] Only the non-UI data layer is ported so far: Document, Cursor/Cursors, Transactions (undo/redo),
--- text get/set, insert/delete and word boundaries. Rendering, languages/colorizer, bracketeer, folding,
+-- text get/set, insert/delete, word boundaries, palettes, languages/colorizer and bracketeer. Rendering, folding,
 -- typesetting, markers, squiggles and find/replace are not ported yet.
 return function(G)
     local ImGui, ImVec2, ImVec4 = G.ImGui, G.ImVec2, G.ImVec4
     local TextEditor = {}
     TextEditor.__index = TextEditor
 
-    -- [Port] subset of upstream's Color enum (only what the data layer needs)
-    local Color = { text = 1 }
+    -- color palette support
+    -- [Port] enum values are 1-based so they index a Palette (a Lua array of IM_COL32 ints) directly
+    local Color = {
+        text = 1,
+        keyword = 2,
+        declaration = 3,
+        number = 4,
+        string = 5,
+        punctuation = 6,
+        preprocessor = 7,
+        identifier = 8,
+        knownIdentifier = 9,
+        comment = 10,
+        background = 11,
+        cursor = 12,
+        selection = 13,
+        whitespace = 14,
+        matchingBracketBackground = 15,
+        matchingBracketActive = 16,
+        matchingBracketLevel1 = 17,
+        matchingBracketLevel2 = 18,
+        matchingBracketLevel3 = 19,
+        matchingBracketError = 20,
+        lineNumber = 21,
+        currentLineNumber = 22,
+        currentLineHighlight = 23,
+        currentLineHighlightBorder = 24,
+        count = 24,
+    }
     TextEditor.Color = Color
+
+    -- colorizer/tokenizer state
+    -- [Port] LineState is a plain integer enum (same order as upstream)
+    local LineState = {
+        inText = 0,
+        inComment = 1, -- inCommentLevel1..7 = 2..8
+        inSingleQuotedString = 9,
+        inDoubleQuotedString = 10,
+        inOtherString = 11,
+        inOtherStringAlt = 12,
+        inStringLevel0 = 13, -- inStringLevel1..7 = 14..20
+    }
+    local maxCommentLevel = 7
+    local maxStringLevel = 7
+    local function lineStateInComment(state) return state >= 1 and state <= 8 end
+    local function lineStateInStringLevel(state) return state >= 13 and state <= 20 end
+    local function commentLevelToLineState(level) return LineState.inComment + level end
+    local function stringLevelToLineState(level) return LineState.inStringLevel0 + level end
 
     --
     -- DocPos: logical position of a glyph expressed as a line number and glyph index (both zero-based)
@@ -121,12 +166,17 @@ return function(G)
     function Document:size() return #self.lines end
     function Document:at(line) return self.lines[line + 1] end
 
+    -- [Port] a line is an array of glyphs with hash fields { needsColorizing, state } (upstream's Line members)
+    local function newLine()
+        return { needsColorizing = true, state = LineState.inText }
+    end
+
     function Document:appendLine()
-        self.lines[#self.lines + 1] = {}
+        self.lines[#self.lines + 1] = newLine()
     end
 
     function Document:insertLine(offset)
-        table.insert(self.lines, offset + 1, {})
+        table.insert(self.lines, offset + 1, newLine())
     end
 
     function Document:deleteLines(s, e)
@@ -206,10 +256,16 @@ return function(G)
             end
         end
 
-        self.updated = true
-
         -- determine end of insert
-        return newDocPos(lineNo, index)
+        local e = newDocPos(lineNo, index)
+
+        -- mark affected lines as changed
+        for j = start.line, e.line do
+            self:at(j).needsColorizing = true
+        end
+
+        self.updated = true
+        return e
     end
 
     function Document:deleteText(config, start, e)
@@ -237,6 +293,8 @@ return function(G)
             self:deleteLines(start.line + 1, e.line)
         end
 
+        -- mark line and document as changed
+        startLine.needsColorizing = true
         self.updated = true
     end
 
@@ -285,6 +343,14 @@ return function(G)
             return line[location.index + 1].codepoint
         end
         return 0xFFFD -- IM_UNICODE_CODEPOINT_INVALID
+    end
+
+    function Document:getColor(location)
+        local line = self:at(location.line)
+        if location.index < #line then
+            return line[location.index + 1].color
+        end
+        return Color.text
     end
 
     -- see if document is empty
@@ -952,6 +1018,750 @@ return function(G)
 
     TextEditor.Transactions = Transactions
 
+
+    --
+    -- Color palettes
+    --
+
+    local IM_COL32 = G.IM_COL32
+
+    local darkPalette = {
+        IM_COL32(224, 224, 224, 255), -- text
+        IM_COL32(197, 134, 192, 255), -- keyword
+        IM_COL32( 90, 179, 155, 255), -- declaration
+        IM_COL32(181, 206, 168, 255), -- number
+        IM_COL32(206, 145, 120, 255), -- string
+        IM_COL32(255, 255, 153, 255), -- punctuation
+        IM_COL32( 64, 192, 128, 255), -- preprocessor
+        IM_COL32(156, 220, 254, 255), -- identifier
+        IM_COL32( 79, 193, 255, 255), -- known identifier
+        IM_COL32(106, 153,  85, 255), -- comment
+        IM_COL32( 30,  30,  30, 255), -- background
+        IM_COL32(224, 224, 224, 255), -- cursor
+        IM_COL32( 32,  96, 160, 255), -- selection
+        IM_COL32( 80,  80,  80, 255), -- whitespace
+        IM_COL32( 70,  70,  70, 255), -- matchingBracketBackground
+        IM_COL32(140, 140, 140, 255), -- matchingBracketActive
+        IM_COL32(246, 222,  36, 255), -- matchingBracketLevel1
+        IM_COL32( 66, 120, 198, 255), -- matchingBracketLevel2
+        IM_COL32(213,  96, 213, 255), -- matchingBracketLevel3
+        IM_COL32(198,   8,  32, 255), -- matchingBracketError
+        IM_COL32(128, 128, 144, 255), -- line number
+        IM_COL32(224, 224, 240, 255), -- current line number
+        IM_COL32(255, 255, 255,   8), -- current line highlight
+        IM_COL32(255, 255, 255,  16), -- current line highlight border
+    }
+
+    local lightPalette = {
+        IM_COL32( 64,  64,  64, 255), -- text
+        IM_COL32(170,   0, 220, 255), -- keyword
+        IM_COL32( 65,   0, 255, 255), -- declaration
+        IM_COL32( 40, 140,  90, 255), -- number
+        IM_COL32(160,  32,  32, 255), -- string
+        IM_COL32(  0,   0,   0, 255), -- punctuation
+        IM_COL32( 96,  96,  64, 255), -- preprocessor
+        IM_COL32( 64,  64,  64, 255), -- identifier
+        IM_COL32( 16,  96,  96, 255), -- known identifier
+        IM_COL32( 35, 135,   5, 255), -- comment
+        IM_COL32(255, 255, 255, 255), -- background
+        IM_COL32(  0,   0,   0, 255), -- cursor
+        IM_COL32(  0,   0,  96,  64), -- selection
+        IM_COL32(144, 144, 144, 144), -- whitespace
+        IM_COL32(180, 180, 180, 144), -- matchingBracketBackground
+        IM_COL32( 72,  72,  72, 255), -- matchingBracketActive
+        IM_COL32( 70,   0, 250, 255), -- matchingBracketLevel1
+        IM_COL32( 80, 160,  70, 255), -- matchingBracketLevel2
+        IM_COL32(120,  60,  25, 255), -- matchingBracketLevel3
+        IM_COL32(198,   8,  32, 255), -- matchingBracketError
+        IM_COL32(  0,  80,  80, 255), -- line number
+        IM_COL32(  0,   0,   0, 255), -- current line number
+        IM_COL32(  0,   0,   0,   8), -- current line highlight
+        IM_COL32(  0,   0,   0,  16), -- current line highlight border
+    }
+
+    -- [Port] palettes are returned as copies so callers can't mutate the built-in ones
+    function TextEditor.GetDarkPalette() return table.clone(darkPalette) end
+    function TextEditor.GetLightPalette() return table.clone(lightPalette) end
+
+    local defaultPalette = table.clone(darkPalette)
+    function TextEditor.SetDefaultPalette(value) defaultPalette = table.clone(value) end
+    function TextEditor.GetDefaultPalette() return defaultPalette end
+
+    --
+    -- Language support
+    --
+    -- [Port] a Language is a plain table with upstream's fields:
+    --   name, caseSensitive, preprocess (codepoint or nil), singleLineComment, singleLineCommentAlt,
+    --   commentStart, commentEnd, commentLevelStart, commentLevelEnd, hasSingleQuotedStrings,
+    --   hasDoubleQuotedStrings, otherStringStart, otherStringEnd, otherStringAltStart, otherStringAltEnd,
+    --   stringEscape (codepoint or nil), stringLevelStart, stringLevelEnd, indentationForBlocks,
+    --   keywords/declarations/identifiers (sets: { [word] = true }), isPunctuation(codepoint),
+    --   getIdentifier, getNumber, customTokenizer.
+    -- [Port] Iterator replacement: tokenizer functions receive (text, i) where `text` is the line encoded as one
+    --   byte per glyph (codepoints >= 128 become "\128") and `i` is the 1-based glyph index of the token start.
+    --   They return the index after the token (returning `i` means no token was found). Level functions return
+    --   (end, level); customTokenizer returns (end, color). Delimiter strings must be ASCII.
+    --
+
+    local Language = {}
+    TextEditor.Language = Language
+    TextEditor.LanguageDefinition = Language -- [Port] classic API alias
+
+    local function makeSet(list)
+        local set = {}
+        for _, word in ipairs(list) do
+            set[word] = true
+        end
+        return set
+    end
+
+    local function makePunctuation(chars)
+        local set = {}
+        for i = 1, #chars do
+            set[string.byte(chars, i)] = true
+        end
+        return function(codepoint) return set[codepoint] == true end
+    end
+
+    -- [Port] Luau patterns replace upstream's re2c generated scanners; the first (longest-first) match wins
+    local function patternScanner(patterns)
+        return function(text, i)
+            for _, pattern in ipairs(patterns) do
+                local _, e = string.find(text, pattern, i)
+                if e then
+                    return e + 1
+                end
+            end
+            return i
+        end
+    end
+
+    -- [Port] isXidStart/isXidContinue: ASCII rules, every non-ASCII glyph is accepted
+    local function getCStyleIdentifier(text, i)
+        local _, e = string.find(text, "^[%a_\128][%w_\128]*", i)
+        if e then return e + 1 end
+        return i
+    end
+
+    local getCStyleNumber = patternScanner({
+        "^0[xX]%x+[uUlL]*",
+        "^0[bB][01]+[uUlL]*",
+        "^%d+%.?%d*[eE][%+%-]?%d+[fFlL]?",
+        "^%.%d+[eE][%+%-]?%d+[fFlL]?",
+        "^%d+%.%d*[fFlL]?",
+        "^%.%d+[fFlL]?",
+        "^%d+[uUlL]*",
+    })
+
+    local getLuaStyleNumber = patternScanner({
+        "^0[xX]%x*%.?%x*[pP][%+%-]?%d+",
+        "^0[xX]%x+%.?%x*",
+        "^0[xX]%.%x+",
+        "^%d+%.?%d*[eE][%+%-]?%d+",
+        "^%.%d+[eE][%+%-]?%d+",
+        "^%d+%.?%d*",
+        "^%.%d+",
+    })
+
+    local isCStylePunctuation = makePunctuation("!%&()*+,-./:;<=>?[]^{|}~")
+    -- []{}!%#^&*()-+=~|<>?:/;,.
+    local isLuaStylePunctuation = makePunctuation("[]{}!%#^&*()-+=~|<>?:/;,.")
+
+    local function luaCommentLevelStart(text, i)
+        local _, e, eq = string.find(text, "^%-%-%[(=*)%[", i)
+        if e then return e + 1, #eq end
+        return i, 0
+    end
+
+    local function luaCommentLevelEnd(text, i)
+        local _, e, eq = string.find(text, "^%](=*)%]", i)
+        if e then return e + 1, #eq end
+        return i, 0
+    end
+
+    local function luaStringLevelStart(text, i)
+        local _, e, eq = string.find(text, "^%[(=*)%[", i)
+        if e then return e + 1, #eq end
+        return i, 0
+    end
+
+    local luaStringLevelEnd = luaCommentLevelEnd
+
+    local cLanguage, cppLanguage, luaLanguage
+
+    function Language.C()
+        if not cLanguage then
+            cLanguage = {
+                name = "C",
+                caseSensitive = true,
+                preprocess = string.byte("#"),
+                singleLineComment = "//",
+                commentStart = "/*",
+                commentEnd = "*/",
+                hasSingleQuotedStrings = true,
+                hasDoubleQuotedStrings = true,
+                stringEscape = string.byte("\\"),
+                keywords = makeSet({
+                    "break", "case", "continue", "default", "do", "else", "for", "goto", "if", "return", "sizeof",
+                    "switch", "while", "_Alignas", "_Alignof", "_Atomic", "_Bool", "_Complex", "_Generic",
+                    "_Imaginary", "_Noreturn", "_Static_assert", "_Thread_local",
+                }),
+                declarations = makeSet({
+                    "auto", "char", "const", "double", "enum", "extern", "float", "inline", "int", "long", "register",
+                    "restrict", "short", "signed", "static", "struct", "typedef", "union", "unsigned", "void", "volatile",
+                }),
+                identifiers = {},
+                isPunctuation = isCStylePunctuation,
+                getIdentifier = getCStyleIdentifier,
+                getNumber = getCStyleNumber,
+            }
+        end
+        return cLanguage
+    end
+
+    function Language.Cpp()
+        if not cppLanguage then
+            cppLanguage = {
+                name = "C++",
+                caseSensitive = true,
+                preprocess = string.byte("#"),
+                singleLineComment = "//",
+                commentStart = "/*",
+                commentEnd = "*/",
+                hasSingleQuotedStrings = true,
+                hasDoubleQuotedStrings = true,
+                stringEscape = string.byte("\\"),
+                keywords = makeSet({
+                    "alignas", "alignof", "and", "and_eq", "asm", "atomic_cancel", "atomic_commit", "atomic_noexcept",
+                    "bitand", "bitor", "break", "case", "catch", "compl", "const_cast", "continue", "default", "delete",
+                    "do", "dynamic_cast", "else", "explicit", "export", "extern", "false", "for", "goto", "if", "import",
+                    "new", "noexcept", "not", "not_eq", "nullptr", "operator", "or", "or_eq", "reinterpret_cast", "requires",
+                    "return", "sizeof", "static_assert", "static_cast", "switch", "synchronized", "this", "thread_local",
+                    "throw", "true", "try", "while", "xor", "xor_eq",
+                }),
+                declarations = makeSet({
+                    "auto", "bool", "char", "char8_t", "char16_t", "char32_t", "class", "concept", "const", "constexpr", "decltype",
+                    "double", "explicit", "export", "extern", "enum", "extern", "float", "friend", "inline", "int", "long",
+                    "module", "mutable", "namespace", "private", "protected", "public", "register", "restrict", "short",
+                    "signed", "static", "struct", "template", "typedef", "typeid", "typename", "union", "using", "unsigned",
+                    "virtual", "void", "volatile", "wchar_t",
+                }),
+                identifiers = {},
+                isPunctuation = isCStylePunctuation,
+                getIdentifier = getCStyleIdentifier,
+                getNumber = getCStyleNumber,
+            }
+        end
+        return cppLanguage
+    end
+
+    function Language.Lua()
+        if not luaLanguage then
+            luaLanguage = {
+                name = "Lua",
+                caseSensitive = true,
+                singleLineComment = "--",
+                commentLevelStart = luaCommentLevelStart,
+                commentLevelEnd = luaCommentLevelEnd,
+                hasSingleQuotedStrings = true,
+                hasDoubleQuotedStrings = true,
+                stringLevelStart = luaStringLevelStart,
+                stringLevelEnd = luaStringLevelEnd,
+                stringEscape = string.byte("\\"),
+                keywords = makeSet({
+                    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in", "local", "nil",
+                    "not", "or", "repeat", "return", "then", "true", "until", "while",
+                }),
+                declarations = {},
+                identifiers = makeSet({
+                    "_G", "_VERSION", "abs", "acos", "asin", "assert", "atan", "atan2", "byte", "ceil", "char", "clock", "close",
+                    "collectgarbage", "concat", "coroutine", "cos", "cosh", "cpath", "create", "date", "debug", "deg", "difftime",
+                    "dofile", "dump", "error", "execute", "exit", "exp", "find", "floor", "flush", "fmod", "format", "frexp", "getenv",
+                    "getfenv", "gethook", "getinfo", "getlocal", "getmetatable", "getregistry", "getupvalue", "gmatch", "gsub", "huge",
+                    "input", "insert", "io", "ipairs", "ldexp", "len", "lines", "load", "loaded", "loaders", "loadfile", "loadlib",
+                    "loadstring", "log", "log10", "lower", "match", "math", "max", "maxn", "min", "modf", "module", "next", "open",
+                    "os", "output", "package", "pairs", "path", "pcall", "pi", "popen", "pow", "preload", "print", "rad", "random",
+                    "randomseed", "rawequal", "rawget", "rawset", "read", "remove", "rename", "rep", "require", "resume", "reverse",
+                    "running", "seeall", "seek", "select", "setfenv", "sethook", "setlocal", "setlocale", "setmetatable", "setupvalue",
+                    "setvbuf", "sin", "sinh", "sort", "sqrt", "status", "stderr", "stdin", "stdout", "string", "sub", "table", "tan",
+                    "tanh", "time", "tmpfile", "tmpname", "tonumber", "tostring", "traceback", "type", "unpack", "upper", "wrap",
+                    "write", "xpcall", "yield",
+                }),
+                isPunctuation = isLuaStylePunctuation,
+                getIdentifier = getCStyleIdentifier,
+                getNumber = getLuaStyleNumber,
+            }
+        end
+        return luaLanguage
+    end
+
+    -- [Port] TODO: Cs, AngelScript, Python, Glsl, Hlsl, Json, Markdown, Sql
+
+    --
+    -- Colorizer: overlay to colorize text (based on language tokenizing)
+    --
+
+    local Colorizer = {}
+    Colorizer.__index = Colorizer
+
+    function Colorizer.new()
+        return setmetatable({ language = nil }, Colorizer)
+    end
+
+    -- set color for specified range of glyphs (1-based, end exclusive)
+    local function setColor(line, s, e, color)
+        for i = s, e - 1 do
+            line[i].color = color
+        end
+    end
+
+    -- [Port] encode a line as one byte per glyph so Luau patterns can scan it (see Language notes)
+    local function lineToText(line)
+        local bytes = table.create(#line)
+        for i, glyph in ipairs(line) do
+            local cp = glyph.codepoint
+            if cp >= 128 then cp = 128 end
+            bytes[i] = string.char(cp)
+        end
+        return table.concat(bytes)
+    end
+
+    -- see if text at glyph i matches provided string
+    local function matches(text, i, str)
+        return string.sub(text, i, i + #str - 1) == str
+    end
+
+    -- update color in a single line
+    function Colorizer:updateLine(line)
+        -- initialize local variables
+        local language = self.language
+        local state = line.state
+        local nonWhiteSpace = false
+        local text = lineToText(line)
+        local glyph = 1
+        local e = #line + 1
+        local isWhiteSpace = CodePoint.isWhiteSpace
+
+        -- process all glyphs on this line
+        while glyph < e do
+            -- start parsing glyphs
+            local start = glyph
+            local codepoint = line[glyph].codepoint
+
+            if state == LineState.inText then
+                -- special handling for preprocessor lines
+                if not nonWhiteSpace and language.preprocess and codepoint ~= language.preprocess and not isWhiteSpace(codepoint) then
+                    nonWhiteSpace = true
+                end
+
+                -- are we starting a multilevel, multiline comment
+                if language.commentLevelStart then
+                    local tokenEnd, level = language.commentLevelStart(text, glyph)
+                    if tokenEnd ~= glyph then
+                        state = commentLevelToLineState(math.min(level, maxCommentLevel))
+                        setColor(line, glyph, tokenEnd, Color.comment)
+                        glyph = tokenEnd
+                    end
+                end
+
+                -- are we starting a multilevel, multiline string
+                if glyph == start and language.stringLevelStart then
+                    local tokenEnd, level = language.stringLevelStart(text, glyph)
+                    if tokenEnd ~= glyph then
+                        state = stringLevelToLineState(math.min(level, maxStringLevel))
+                        setColor(line, glyph, tokenEnd, Color.string)
+                        glyph = tokenEnd
+                    end
+                end
+
+                if glyph == start then
+                    local commentStart = language.commentStart
+                    local singleLineComment = language.singleLineComment
+                    local singleLineCommentAlt = language.singleLineCommentAlt
+                    local otherStringStart = language.otherStringStart
+                    local otherStringAltStart = language.otherStringAltStart
+
+                    -- mark whitespace characters
+                    if isWhiteSpace(codepoint) then
+                        line[glyph].color = Color.whitespace
+                        glyph = glyph + 1
+
+                    -- are we starting a multiline comment
+                    elseif commentStart and #commentStart > 0 and matches(text, glyph, commentStart) then
+                        state = LineState.inComment
+                        setColor(line, glyph, glyph + #commentStart, Color.comment)
+                        glyph = glyph + #commentStart
+
+                    -- handle single line comments
+                    elseif singleLineComment and #singleLineComment > 0 and matches(text, glyph, singleLineComment) then
+                        setColor(line, glyph, e, Color.comment)
+                        glyph = e
+
+                    elseif singleLineCommentAlt and #singleLineCommentAlt > 0 and matches(text, glyph, singleLineCommentAlt) then
+                        setColor(line, glyph, e, Color.comment)
+                        glyph = e
+
+                    -- are we starting a special string
+                    elseif otherStringStart and #otherStringStart > 0 and matches(text, glyph, otherStringStart) then
+                        state = LineState.inOtherString
+                        setColor(line, glyph, glyph + #otherStringStart, Color.string)
+                        glyph = glyph + #otherStringStart
+
+                    elseif otherStringAltStart and #otherStringAltStart > 0 and matches(text, glyph, otherStringAltStart) then
+                        state = LineState.inOtherStringAlt
+                        setColor(line, glyph, glyph + #otherStringAltStart, Color.string)
+                        glyph = glyph + #otherStringAltStart
+
+                    -- are we starting a single quoted string
+                    elseif language.hasSingleQuotedStrings and codepoint == 39 then
+                        state = LineState.inSingleQuotedString
+                        line[glyph].color = Color.string
+                        glyph = glyph + 1
+
+                    -- are we starting a double quoted string
+                    elseif language.hasDoubleQuotedStrings and codepoint == 34 then
+                        state = LineState.inDoubleQuotedString
+                        line[glyph].color = Color.string
+                        glyph = glyph + 1
+
+                    -- is this a preprocessor line
+                    elseif language.preprocess and not nonWhiteSpace and codepoint == language.preprocess then
+                        setColor(line, 1, e, Color.preprocessor)
+                        glyph = e
+                    end
+                end
+
+                if glyph == start then
+                    -- nothing worked so far so it's time to do some tokenizing
+                    local tokenEnd, color = glyph, nil
+                    if language.customTokenizer then
+                        tokenEnd, color = language.customTokenizer(text, glyph)
+                    end
+
+                    -- handle custom tokenizer (if we have one)
+                    if tokenEnd ~= glyph then
+                        setColor(line, glyph, tokenEnd, color)
+                        glyph = tokenEnd
+                    else
+                        if language.getIdentifier then
+                            tokenEnd = language.getIdentifier(text, glyph)
+                        end
+
+                        -- do we have an identifier
+                        if tokenEnd ~= glyph then
+                            -- determine identifier text and color
+                            local parts = {}
+                            for i = glyph, tokenEnd - 1 do
+                                parts[#parts + 1] = utf8.char(line[i].codepoint)
+                            end
+                            local identifier = table.concat(parts)
+                            if language.caseSensitive == false then
+                                identifier = string.lower(identifier)
+                            end
+
+                            color = Color.identifier
+                            if language.keywords and language.keywords[identifier] then
+                                color = Color.keyword
+                            elseif language.declarations and language.declarations[identifier] then
+                                color = Color.declaration
+                            elseif language.identifiers and language.identifiers[identifier] then
+                                color = Color.knownIdentifier
+                            end
+
+                            -- colorize identifier and move on
+                            setColor(line, glyph, tokenEnd, color)
+                            glyph = tokenEnd
+                        else
+                            if language.getNumber then
+                                tokenEnd = language.getNumber(text, glyph)
+                            end
+
+                            -- do we have a number
+                            if tokenEnd ~= glyph then
+                                setColor(line, glyph, tokenEnd, Color.number)
+                                glyph = tokenEnd
+
+                            -- is this punctuation
+                            elseif language.isPunctuation and language.isPunctuation(codepoint) then
+                                line[glyph].color = Color.punctuation
+                                glyph = glyph + 1
+
+                            else
+                                -- I guess we don't know what this character is
+                                line[glyph].color = Color.text
+                                glyph = glyph + 1
+                            end
+                        end
+                    end
+                end
+
+            elseif lineStateInComment(state) then
+                -- stay in comment state until we see the end sequence
+                local commentEnd = language.commentEnd
+                if commentEnd and #commentEnd > 0 and matches(text, glyph, commentEnd) then
+                    setColor(line, glyph, glyph + #commentEnd, Color.comment)
+                    glyph = glyph + #commentEnd
+                    state = LineState.inText
+
+                elseif language.commentLevelEnd then
+                    local tokenEnd, level = language.commentLevelEnd(text, glyph)
+                    if tokenEnd ~= glyph and state == commentLevelToLineState(math.min(level, maxCommentLevel)) then
+                        setColor(line, glyph, tokenEnd, Color.comment)
+                        glyph = tokenEnd
+                        state = LineState.inText
+                    end
+                end
+
+                -- [Port] bounds guard: a level end token at end of line would otherwise index past it
+                if lineStateInComment(state) and glyph < e then
+                    line[glyph].color = Color.comment
+                    glyph = glyph + 1
+                end
+
+            elseif lineStateInStringLevel(state) then
+                -- stay in string level until matching closing is detected
+                local tokenEnd, level = language.stringLevelEnd(text, glyph)
+                if tokenEnd ~= glyph and state == stringLevelToLineState(math.min(level, maxStringLevel)) then
+                    setColor(line, glyph, tokenEnd, Color.string)
+                    glyph = tokenEnd
+                    state = LineState.inText
+                else
+                    line[glyph].color = Color.string
+                    glyph = glyph + 1
+                end
+
+            else
+                -- inOtherString, inOtherStringAlt, inSingleQuotedString or inDoubleQuotedString
+                -- stay in string state until we see the end sequence, skip escaped characters
+                local endString
+                if state == LineState.inOtherString then
+                    endString = language.otherStringEnd
+                elseif state == LineState.inOtherStringAlt then
+                    endString = language.otherStringAltEnd
+                elseif state == LineState.inSingleQuotedString then
+                    endString = "'"
+                else
+                    endString = '"'
+                end
+
+                if codepoint == language.stringEscape then
+                    line[glyph].color = Color.string
+                    glyph = glyph + 1
+                    if glyph < e then
+                        line[glyph].color = Color.string
+                        glyph = glyph + 1
+                    end
+
+                elseif matches(text, glyph, endString) then
+                    setColor(line, glyph, glyph + #endString, Color.string)
+                    glyph = glyph + #endString
+                    state = LineState.inText
+
+                else
+                    line[glyph].color = Color.string
+                    glyph = glyph + 1
+                end
+            end
+        end
+
+        return state
+    end
+
+    -- update state (if required)
+    function Colorizer:update(config, document)
+        -- update all lines on configuration change
+        local configChanged = self.language ~= config.language
+        local lines = document.lines
+        local n = #lines
+
+        if configChanged then
+            self.language = config.language
+            for l = 1, n do
+                local line = lines[l]
+                if self.language then
+                    local state = self:updateLine(line)
+                    if l < n then lines[l + 1].state = state end
+                else
+                    for _, glyph in ipairs(line) do glyph.color = Color.text end
+                    line.state = LineState.inText
+                end
+                line.needsColorizing = false
+            end
+
+        -- update changed lines when document is updated
+        elseif document.updated then
+            for l = 1, n do
+                local line = lines[l]
+                if line.needsColorizing then
+                    if self.language then
+                        local state = self:updateLine(line)
+                        line.needsColorizing = false
+                        local nextLine = lines[l + 1]
+                        if nextLine and nextLine.state ~= state then
+                            nextLine.state = state
+                            nextLine.needsColorizing = true
+                        end
+                    else
+                        for _, glyph in ipairs(line) do glyph.color = Color.text end
+                        line.state = LineState.inText
+                        line.needsColorizing = false
+                    end
+                end
+            end
+        end
+
+        -- return status
+        return configChanged
+    end
+
+    --
+    -- Bracketeer: overlay to manage details about bracketed text
+    -- a BracketPair is { startChar, start = DocPos, endChar, ["end"] = DocPos, level, visible }
+    --
+
+    local openers = { [40] = 41, [123] = 125, [91] = 93 } -- ( { [
+    local closers = { [41] = 40, [125] = 123, [93] = 91 } -- ) } ]
+
+    local function isBracketCandidate(glyph)
+        local color = glyph.color
+        return color == Color.punctuation or color == Color.matchingBracketLevel1 or color == Color.matchingBracketLevel2
+            or color == Color.matchingBracketLevel3 or color == Color.matchingBracketError
+    end
+
+    local function bracketIsAfter(pair, location) return pair.start > location end
+    local function bracketIsAround(pair, location) return pair.start < location and pair["end"] >= location end
+
+    local Bracketeer = {}
+    Bracketeer.__index = Bracketeer
+
+    function Bracketeer.new()
+        return setmetatable({ list = {}, showMatchingBrackets = false, language = nil, updated = false }, Bracketeer)
+    end
+
+    local bracketColors = { Color.matchingBracketLevel1, Color.matchingBracketLevel2, Color.matchingBracketLevel3 }
+
+    -- [Port] invisible (indentation based) blocks are not generated yet (no language uses indentationForBlocks)
+    function Bracketeer:update(config, document)
+        -- see if the configuration changed
+        local configChanged = self.showMatchingBrackets ~= config.showMatchingBrackets or self.language ~= config.language
+        self.showMatchingBrackets = config.showMatchingBrackets
+        self.language = config.language
+
+        if configChanged and not self.showMatchingBrackets then
+            -- if configuration changed, clear the bracket pair list and reset glyph colors
+            table.clear(self.list)
+            for _, line in ipairs(document.lines) do
+                for _, glyph in ipairs(line) do
+                    local color = glyph.color
+                    if color == Color.matchingBracketLevel1 or color == Color.matchingBracketLevel2
+                        or color == Color.matchingBracketLevel3 or color == Color.matchingBracketError then
+                        glyph.color = Color.punctuation
+                    end
+                end
+            end
+
+        elseif self.showMatchingBrackets and (configChanged or document.updated) then
+            -- if configuration or document changed, recalculate bracket pair list
+            local previous = self.list
+            local list = {}
+            local levels = {}
+            local level = 0
+
+            -- process all the glyphs
+            for l, line in ipairs(document.lines) do
+                for i, glyph in ipairs(line) do
+                    -- handle a "bracket opener" that is not in a comment, string or preprocessor statement
+                    if isBracketCandidate(glyph) and openers[glyph.codepoint] then
+                        -- start a new level
+                        list[#list + 1] = { startChar = glyph.codepoint, start = newDocPos(l - 1, i - 1), endChar = 0, ["end"] = newDocPos(0, 0), level = level, visible = true }
+                        levels[#levels + 1] = #list
+                        glyph.color = bracketColors[level % 3 + 1]
+                        level = level + 1
+
+                    -- handle a "bracket closer" that is not in a comment, string or preprocessor statement
+                    elseif isBracketCandidate(glyph) and closers[glyph.codepoint] then
+                        if #levels > 0 then
+                            local lastBracket = list[table.remove(levels)]
+                            level = level - 1
+
+                            if lastBracket.startChar == closers[glyph.codepoint] then
+                                -- handle matching bracket
+                                glyph.color = bracketColors[level % 3 + 1]
+                                lastBracket.endChar = glyph.codepoint
+                                lastBracket["end"] = newDocPos(l - 1, i - 1)
+                            else
+                                -- no matching bracket, mark brackets as errors
+                                glyph.color = Color.matchingBracketError
+                                document:at(lastBracket.start.line)[lastBracket.start.index + 1].color = Color.matchingBracketError
+                                table.remove(list)
+                            end
+
+                        -- this is a closer without an opener
+                        else
+                            glyph.color = Color.matchingBracketError
+                        end
+                    end
+                end
+            end
+
+            -- handle levels left open and mark them as errors
+            for j = #levels, 1, -1 do
+                local s = list[levels[j]].start
+                document:at(s.line)[s.index + 1].color = Color.matchingBracketError
+                table.remove(list, levels[j])
+            end
+
+            self.list = list
+
+            -- see if things have changed
+            local changed = #previous ~= #list
+            for j = 1, #list do
+                if changed then break end
+                changed = previous[j].start ~= list[j].start or previous[j]["end"] ~= list[j]["end"]
+            end
+            self.updated = changed
+        end
+    end
+
+    -- find relevant brackets (returns a BracketPair or nil)
+    function Bracketeer:getEnclosingBrackets(first, last)
+        last = last or first
+        local brackets = nil
+        for _, pair in ipairs(self.list) do
+            -- brackets are sorted so no need to go past specified location
+            if bracketIsAfter(pair, first) then
+                break
+            elseif bracketIsAround(pair, first) and bracketIsAround(pair, last) then
+                -- this could be what we're looking for
+                brackets = pair
+            end
+        end
+        return brackets
+    end
+
+    function Bracketeer:getInnerBrackets(first, last)
+        local list = self.list
+        local outer = self:getEnclosingBrackets(first, last)
+        if outer then
+            local start = table.find(list, outer)
+            for j = start + 1, #list do
+                local pair = list[j]
+                if pair.level <= outer.level then
+                    break
+                elseif pair.level == outer.level + 1 and pair.start > first and pair["end"] < last then
+                    return pair
+                end
+            end
+        end
+        return nil
+    end
+
+    function Bracketeer:isUpdated() return self.updated end
+    function Bracketeer:resetUpdated() self.updated = false end
+
+    TextEditor.Colorizer = Colorizer
+    TextEditor.Bracketeer = Bracketeer
+
     --
     -- TextEditor
     --
@@ -959,15 +1769,21 @@ return function(G)
     -- constructor
     function TextEditor.new()
         local self = setmetatable({}, TextEditor)
-        self.config = { tabSize = 4, insertSpacesOnTabs = false, readOnly = false }
+        self.config = { tabSize = 4, insertSpacesOnTabs = false, readOnly = false, showMatchingBrackets = true, language = nil }
         self.document = Document.new()
         self.cursors = Cursors.new()
         self.transactions = Transactions.new()
+        self.colorizer = Colorizer.new()
+        self.bracketeer = Bracketeer.new()
+        self:SetPalette(defaultPalette)
         return self
     end
 
     function TextEditor:reset()
         self.document = Document.new()
+        -- [Port] a fresh document needs a full recolor/rebracket
+        self.colorizer.language = nil
+        self.bracketeer.language = nil
         self.transactions:reset()
         self.cursors:clearAll()
         -- [Port] markers, squiggles and scrolling not ported yet
@@ -987,6 +1803,42 @@ return function(G)
     -- [Port] short aliases
     TextEditor.SetReadOnly = TextEditor.SetReadOnlyEnabled
     TextEditor.IsReadOnly = TextEditor.IsReadOnlyEnabled
+
+    function TextEditor:SetShowMatchingBrackets(value) self.config.showMatchingBrackets = value end
+    function TextEditor:IsShowingMatchingBrackets() return self.config.showMatchingBrackets end
+
+    -- color palette support
+    -- [Port] no style alpha is applied yet (updatePalettes is part of rendering)
+    function TextEditor:SetPalette(newPalette) self.paletteBase = table.clone(newPalette) end
+    function TextEditor:GetPalette() return self.paletteBase end
+
+    -- language support
+    function TextEditor:SetLanguage(language)
+        self.config.language = language
+        if self.languageChangeCallback then
+            self.languageChangeCallback()
+        end
+    end
+    function TextEditor:GetLanguage() return self.config.language end
+    function TextEditor:HasLanguage() return self.config.language ~= nil end
+    function TextEditor:GetLanguageName()
+        if self.config.language == nil then return "None" end
+        return self.config.language.name
+    end
+    function TextEditor:SetLanguageChangeCallback(callback) self.languageChangeCallback = callback end
+    -- [Port] classic API alias
+    TextEditor.SetLanguageDefinition = TextEditor.SetLanguage
+
+    -- [Port] color of glyph at position (upstream's Document::getColor); runs updateState first
+    function TextEditor:GetGlyphColor(pos)
+        self:updateState()
+        return self.document:getColor(self:normalizePos(pos))
+    end
+
+    function TextEditor:SelectToBrackets(includeBrackets)
+        if includeBrackets == nil then includeBrackets = true end
+        self:selectToBrackets(includeBrackets)
+    end
 
     -- set/get editor text (UTF-8 encoded)
     -- [Port] a table of lines is accepted too (upstream's std::vector overload)
@@ -1107,6 +1959,32 @@ return function(G)
     function TextEditor:selectRegion(s, e)
         if e < s then s, e = e, s end
         self.cursors:setCursor(s, e)
+    end
+
+    -- handle possible changes caused by the API or user interactions
+    -- [Port] called by render upstream; until rendering is ported call it (or GetGlyphColor) to update overlays
+    function TextEditor:updateState()
+        self.colorizer:update(self.config, self.document)
+        self.bracketeer:update(self.config, self.document)
+        self.cursors:update(self.document)
+        local documentChanged = self.document.updated
+        self.document.updated = false
+        self.bracketeer:resetUpdated()
+        return documentChanged
+    end
+
+    function TextEditor:selectToBrackets(includeBrackets)
+        self:updateState()
+        for _, cursor in ipairs(self.cursors.list) do
+            local bracket = self.bracketeer:getEnclosingBrackets(cursor:getSelectionStart())
+            if bracket then
+                if includeBrackets then
+                    cursor:update(bracket.start, self.document:getRight(bracket["end"]))
+                else
+                    cursor:update(self.document:getRight(bracket.start), bracket["end"])
+                end
+            end
+        end
     end
 
     function TextEditor:moveTo(coordinate, select)
