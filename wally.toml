@@ -1,0 +1,11 @@
+[package]
+name = "4dbug/imguicolortextedit-luau"
+version = "0.1.0"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+license = "MIT"
+description = "Syntax-highlighting text editor widget for imgui-luau (Roblox / LÖVE)."
+include = ["TextEditor.lua", "LICENSE", "README.md", "wally.toml", "default.project.json"]
+
+[peer-dependencies]
+ImGui = "4dbug/imgui-luau@^0.4.0"

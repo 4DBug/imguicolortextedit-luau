@@ -1,0 +1,5 @@
+local RS = game:GetService("ReplicatedStorage")
+local G = require(RS:WaitForChild("ImGui"))
+local TextEditor = require(RS:WaitForChild("TextEditor"))(G)
+assert(type(TextEditor) == "table", "module did not return a table")
+print("OK")

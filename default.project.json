@@ -1,0 +1,11 @@
+{
+	"name": "imguicolortextedit-luau",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"ImGui": { "$path": "tools/core/build/ImGuiTyped.luau", "Impl": { "$path": "tools/core/build/ImGui.luau" } },
+			"TextEditor": { "$path": "TextEditor.lua" }
+		},
+		"StarterPlayer": { "StarterPlayerScripts": { "TextEditorExample": { "$path": "examples/roblox/main.client.luau" } } }
+	}
+}
