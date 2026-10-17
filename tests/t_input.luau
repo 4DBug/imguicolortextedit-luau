@@ -37,6 +37,7 @@ local steps = {
     [34] = function() io:AddMousePosEvent(60, 30) end,
     [35] = function() io:AddKeyEvent(G.ImGuiMod_Ctrl, true); io:AddMouseButtonEvent(0, true) end,
     [36] = function() io:AddMouseButtonEvent(0, false); io:AddKeyEvent(G.ImGuiMod_Ctrl, false) end,
+    [40] = function() ctrl(Key.F) end,
 }
 
 local checks = {
@@ -51,6 +52,7 @@ local checks = {
     [27] = function() eq(ImGui.GetClipboardText(), "local x = 1!\n", "ctrl+c") end,
     [31] = function() eq(editor:GetText(), "local x = 1!\nlocal x = 1!\n", "ctrl+v") end,
     [37] = function() eq(editor:GetNumberOfCursors(), 2, "ctrl+click adds cursor") end,
+    [44] = function() assert(editor:IsFindReplaceWindowVisible(), "ctrl+f opens find") end,
 }
 
 local frame = 0

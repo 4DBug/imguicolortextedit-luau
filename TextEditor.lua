@@ -10,7 +10,7 @@
 -- [Port] Ported: Document, Cursor/Cursors, Transactions (undo/redo), text get/set, insert/delete, word boundaries,
 -- palettes, languages/colorizer, bracketeer, Render (line numbers, selections, text, carets, brackets, markers,
 -- scrolling), keyboard and mouse handling, clipboard. Not ported yet: word wrap/typesetting, folding, minimap,
--- squiggles, decorations, autocomplete and find/replace (see `[Port] TODO`).
+-- squiggles, decorations and autocomplete (see `[Port] TODO`).
 return function(G)
     local ImGui, ImVec2, ImVec4 = G.ImGui, G.ImVec2, G.ImVec4
     local TextEditor = {}
@@ -1774,7 +1774,7 @@ return function(G)
             tabSize = 4, insertSpacesOnTabs = false, lineSpacing = 1.0, readOnly = false, caretsVisible = true,
             autoIndent = true, showSpaces = true, showTabs = true, showLineNumbers = true, showCurrentLineHighlight = true,
             showMatchingBrackets = true, completePairedGlyphs = true, overwrite = false, leftMargin = 1, textMargin = 2,
-            language = nil,
+            language = nil, panMode = false, findReplaceEnabled = true,
         }
         self.document = Document.new()
         self.cursors = Cursors.new()
@@ -1800,6 +1800,21 @@ return function(G)
         self.completePairCloser = 0
         self.completePairLocation = newDocPos(0, 0)
         self.popupDocPos = newDocPos(0, 0)
+        self.panning = false
+        self.scrolling = false
+        self.scrollStart = ImVec2(0, 0)
+
+        -- find and replace context
+        self.findButtonLabel = "Find"
+        self.findAllButtonLabel = "Find All"
+        self.replaceButtonLabel = "Replace"
+        self.replaceAllButtonLabel = "Replace All"
+        self.findReplaceVisible = false
+        self.focusOnFind = false
+        self.findText = ""
+        self.replaceText = ""
+        self.caseSensitiveFind = false
+        self.wholeWordFind = false
         self:resetScrolling()
         return self
     end
@@ -2448,7 +2463,8 @@ return function(G)
                 self:renderLineNumberMarkers()
                 self:renderLineNumbers()
                 -- [Port] TODO: renderDecorations, renderFoldIndicators, renderMiniMap, renderScrollbarMiniMap,
-                -- renderPanScrollIndicator, renderFindReplace
+                -- renderPanScrollIndicator
+                self:renderFindReplace()
                 self:renderPopups()
 
                 -- handle scrolling caused by actions in this frame
@@ -2828,7 +2844,8 @@ return function(G)
             elseif Shortcut(Key.DownArrow, Repeat) then self:moveDown(1, false)
             elseif Shortcut(bor(Mod_Shift, Key.DownArrow), Repeat) then self:moveDown(1, true)
 
-            -- [Port] TODO: shrinkSelections/growSelections (Alt+Shift+Left/Right)
+            elseif Shortcut(bor(altMod, Mod_Shift, Key.LeftArrow)) then self:shrinkSelections()
+            elseif Shortcut(bor(altMod, Mod_Shift, Key.RightArrow)) then self:growSelections()
 
             elseif Shortcut(Key.LeftArrow, Repeat) then self:moveLeft(false, false)
             elseif Shortcut(bor(Mod_Shift, Key.LeftArrow), Repeat) then self:moveLeft(true, false)
@@ -2883,8 +2900,18 @@ return function(G)
             elseif not readOnly and Shortcut(bor(Mod_Ctrl, Key.LeftBracket), Repeat) then self:deindentLines()
             elseif not readOnly and Shortcut(bor(Mod_Ctrl, Key.RightBracket), Repeat) then self:indentLines()
 
-            -- [Port] TODO: moveUpLines/moveDownLines (Alt+Up/Down), toggleComments (Ctrl+/ Ctrl+L),
-            -- find/replace (Ctrl+F, Ctrl+Shift+F, Ctrl+G), autocomplete trigger
+            elseif not readOnly and Shortcut(bor(Mod_Alt, Key.UpArrow)) then self:moveUpLines()
+            elseif not readOnly and Shortcut(bor(Mod_Alt, Key.DownArrow)) then self:moveDownLines()
+
+            elseif not readOnly and self.config.language and Shortcut(bor(Mod_Ctrl, Key.Slash)) then self:toggleComments()
+            elseif not readOnly and self.config.language and Shortcut(bor(Mod_Ctrl, Key.L)) then self:toggleComments()
+
+            -- find/replace support
+            elseif self.config.findReplaceEnabled and Shortcut(bor(Mod_Ctrl, Key.F)) then self:openFindReplace()
+            elseif self.config.findReplaceEnabled and Shortcut(bor(Mod_Ctrl, Mod_Shift, Key.F)) then self:findAll()
+            elseif self.config.findReplaceEnabled and Shortcut(bor(Mod_Ctrl, Key.G), Repeat) then self:findNext()
+
+            -- [Port] TODO: autocomplete trigger
 
             -- change insert mode
             elseif Shortcut(Key.Insert) then self.config.overwrite = not self.config.overwrite
@@ -2904,8 +2931,12 @@ return function(G)
             elseif not readOnly and Shortcut(bor(Mod_Shift, Key.Tab), Repeat) then self:deindentLines()
 
             -- handle escape key
-            elseif cursors:hasMultiple() and Shortcut(Key.Escape) then
-                cursors:clearAdditional()
+            elseif (self.findReplaceVisible or cursors:hasMultiple()) and Shortcut(Key.Escape) then
+                if self.findReplaceVisible then
+                    self:closeFindReplace()
+                else
+                    cursors:clearAdditional()
+                end
             end
 
             -- handle regular text
@@ -2932,7 +2963,7 @@ return function(G)
         --
         -- TextEditor::handleMouseInteractions
         --
-        -- [Port] TODO: middle mouse panning/scrolling, minimap scrollbar dragging, text hover popup
+        -- [Port] TODO: minimap scrollbar dragging, text hover popup, pan/scroll indicator
 
         function TextEditor:handleMouseInteractions()
             local io = ImGui.GetIO()
@@ -2956,8 +2987,51 @@ return function(G)
             local cursors = self.cursors
             local document = self.document
 
+            local absoluteMouseY = mouse.y - windowPos.y
+            self.panning = self.panning and self.config.panMode and ImGui.IsMouseDown(2)
+
+            -- handle middle mouse button panning
+            if self.panning and ImGui.IsMouseDragging(2) then
+                local windowSize = ImGui.GetWindowSize()
+                local mouseDelta = ImGui.GetMouseDragDelta(2)
+                local deltaX, deltaY = mouseDelta.x, mouseDelta.y
+                local dragFactor = io.DeltaTime * 15.0
+                local marginX, marginY = glyphSize.x * 4.0, glyphSize.y * 2.0
+
+                if absoluteMouseX < self.textLeftOffset + marginX then
+                    deltaX = (absoluteMouseX - (self.textLeftOffset + marginX)) * dragFactor
+                elseif absoluteMouseX > windowSize.x - marginX then
+                    deltaX = (absoluteMouseX - (windowSize.x - marginX)) * dragFactor
+                end
+
+                if absoluteMouseY < marginY then
+                    deltaY = (absoluteMouseY - marginY) * dragFactor
+                elseif absoluteMouseY > windowSize.y - marginY then
+                    deltaY = (absoluteMouseY - (windowSize.y - marginY)) * dragFactor
+                end
+
+                ImGui.SetScrollX(ImGui.GetScrollX() - deltaX)
+                ImGui.SetScrollY(ImGui.GetScrollY() - deltaY)
+                ImGui.ResetMouseDragDelta(2)
+
+            -- handle middle mouse button scrolling
+            elseif self.scrolling then
+                local deadzone = glyphSize.x
+                local offsetX = self.scrollStart.x - absoluteMouseX
+                local offsetY = self.scrollStart.y - absoluteMouseY
+                if offsetX < 0.0 then offsetX = math.min(offsetX + deadzone, 0.0) else offsetX = math.max(offsetX - deadzone, 0.0) end
+                if offsetY < 0.0 then offsetY = math.min(offsetY + deadzone, 0.0) else offsetY = math.max(offsetY - deadzone, 0.0) end
+
+                local scrollFactor = io.DeltaTime * 5.0
+                ImGui.SetScrollX(ImGui.GetScrollX() - offsetX * scrollFactor)
+                ImGui.SetScrollY(ImGui.GetScrollY() - offsetY * scrollFactor)
+
+                if ImGui.IsMouseClicked(0) or ImGui.IsMouseClicked(2) or ImGui.IsMouseClicked(1) then
+                    self.scrolling = false
+                end
+
             -- handle left mouse button dragging
-            if ImGui.IsMouseDragging(0) then
+            elseif ImGui.IsMouseDragging(0) then
                 -- update selection with dragging left mouse button
                 if self.selectingText and overLineNumbers then
                     local cursor = cursors:getCurrent()
@@ -2985,7 +3059,16 @@ return function(G)
                     ImGui.SetMouseCursor(G.ImGuiMouseCursor.TextInput)
                 end
 
-                if ImGui.IsMouseClicked(1) then
+                if ImGui.IsMouseClicked(2) then
+                    -- start panning/scrolling mode on middle mouse click
+                    if self.config.panMode then
+                        self.panning = true
+                    else
+                        self.scrolling = true
+                        self.scrollStart = ImVec2(absoluteMouseX, absoluteMouseY)
+                    end
+
+                elseif ImGui.IsMouseClicked(1) then
                     -- handle right clicks by setting up context menu (if required)
                     if overLineNumbers and self.lineNumberContextMenuCallback then
                         self.popupDocPos = glyphPos
@@ -3715,8 +3798,629 @@ return function(G)
         function TextEditor:AddNextOccurrence() self:addNextOccurrence(false) end
         function TextEditor:SelectAllOccurrences() self:selectAllOccurrences(false) end
 
-        -- [Port] TODO: find/replace window (renderFindReplace, openFindReplace, find/findNext/findAll/replace/replaceAll),
-        -- grow/shrinkSelections, moveUp/DownLines, toggleComments, filters (case, whitespace, tabs/spaces)
+        function TextEditor:SelectFirstOccurrenceOf(text, caseSensitive, wholeWord)
+            self:selectFirstOccurrenceOf(text, caseSensitive ~= false, wholeWord)
+        end
+
+        function TextEditor:selectFirstOccurrenceOf(text, caseSensitive, wholeWord)
+            local s, e = self.document:findText(newDocPos(0, 0), text, caseSensitive, wholeWord)
+            if s then
+                self.cursors:setCursor(s, e)
+                self:makeCursorVisible()
+            else
+                self.cursors:clearAdditional(true)
+            end
+        end
+
+        function TextEditor:selectNextOccurrenceOf(text, caseSensitive, wholeWord)
+            self:SelectNextOccurrenceOf(text, caseSensitive, wholeWord)
+        end
+
+        --
+        -- grow/shrink selections
+        --
+
+        local function isBracketOpener(ch) return ch == 123 or ch == 91 or ch == 40 end
+
+        function TextEditor:growSelections()
+            local document = self.document
+            for _, cursor in ipairs(self.cursors.list) do
+                if cursor:hasSelection() then
+                    local s = cursor:getSelectionStart()
+                    local e = cursor:getSelectionEnd()
+                    local startCodePoint = document:getCodePoint(document:getLeft(s))
+                    local endCodePoint = document:getCodePoint(e)
+
+                    if isBracketOpener(startCodePoint) and endCodePoint == toPairCloser(startCodePoint) then
+                        cursor:update(document:getLeft(s), document:getRight(e))
+                    else
+                        local bracket = self.bracketeer:getEnclosingBrackets(s, e)
+                        if bracket then
+                            cursor:update(document:getRight(bracket.start), bracket["end"])
+                        end
+                    end
+                else
+                    local pos = cursor:getSelectionEnd()
+                    cursor:update(document:findWordStart(pos), document:findWordEnd(pos))
+                end
+            end
+        end
+
+        function TextEditor:shrinkSelections()
+            local document = self.document
+            for _, cursor in ipairs(self.cursors.list) do
+                if cursor:hasSelection() then
+                    local s = cursor:getSelectionStart()
+                    local e = cursor:getSelectionEnd()
+                    local startCodePoint = document:getCodePoint(s)
+                    local endCodePoint = document:getCodePoint(document:getLeft(e))
+
+                    if isBracketOpener(startCodePoint) and endCodePoint == toPairCloser(startCodePoint) then
+                        cursor:update(document:getRight(s), document:getLeft(e))
+                    else
+                        local bracket = self.bracketeer:getInnerBrackets(s, e)
+                        if bracket then
+                            cursor:update(bracket.start, document:getRight(bracket["end"]))
+                        end
+                    end
+                end
+            end
+        end
+
+        --
+        -- move lines
+        --
+
+        function TextEditor:moveUpLines()
+            local cursors = self.cursors
+            local document = self.document
+
+            -- don't move up if first line is in one of the cursors
+            if cursors:at(0):getSelectionStart().line ~= 0 then
+                local transaction = self:startTransaction()
+
+                for c = 0, cursors:size() - 1 do
+                    local cursor = cursors:at(c)
+                    local s = cursor:getSelectionStart()
+                    local e = cursor:getSelectionEnd()
+
+                    -- delete existing lines
+                    local deleteStart = document:getStartOfLine(s)
+                    local deleteEnd = e
+                    if e.index ~= 0 then deleteEnd = document:getNextLine(e) end
+                    local text = document:getSectionText(deleteStart, deleteEnd)
+                    self:deleteText(transaction, deleteStart, deleteEnd)
+                    cursors:adjustForDelete(c, deleteStart, deleteEnd)
+
+                    -- insert text one line up
+                    local insertStart = newDocPos(deleteStart.line - 1, 0)
+                    local insertEnd = self:insertText(transaction, insertStart, text)
+                    cursors:adjustForInsert(c, insertStart, insertEnd)
+
+                    -- update cursor
+                    cursor:update(newDocPos(s.line - 1, s.index), newDocPos(e.line - 1, e.index))
+                end
+
+                self:endTransaction(transaction)
+            end
+        end
+
+        function TextEditor:moveDownLines()
+            local cursors = self.cursors
+            local document = self.document
+
+            -- don't move down if last line is in one of the cursors
+            -- [Port] upstream tests the last cursor's selection start; a selection ending on the last line would be lost
+            if not document:isLastLine(cursors:at(cursors:size() - 1):getSelectionEnd().line) then
+                local transaction = self:startTransaction()
+
+                for c = 0, cursors:size() - 1 do
+                    local cursor = cursors:at(c)
+                    local s = cursor:getSelectionStart()
+                    local e = cursor:getSelectionEnd()
+
+                    -- delete existing lines
+                    local deleteStart = document:getStartOfLine(s)
+                    local deleteEnd = e
+                    if e.index ~= 0 then deleteEnd = document:getNextLine(e) end
+                    local text = document:getSectionText(deleteStart, deleteEnd)
+                    self:deleteText(transaction, deleteStart, deleteEnd)
+                    cursors:adjustForDelete(c, deleteStart, deleteEnd)
+
+                    -- insert text one line down
+                    local insertStart = document:getNextLine(deleteStart)
+                    -- [Port] when the next line is the last one (no trailing newline), upstream glues the moved text onto it
+                    if insertStart.line == deleteStart.line and string.sub(text, -1) == "\n" then
+                        text = "\n" .. string.sub(text, 1, -2)
+                    end
+                    local insertEnd = self:insertText(transaction, insertStart, text)
+                    cursors:adjustForInsert(c, insertStart, insertEnd)
+
+                    -- update cursor
+                    cursor:update(newDocPos(s.line + 1, s.index), newDocPos(e.line + 1, e.index))
+                end
+
+                self:endTransaction(transaction)
+            end
+        end
+
+        --
+        -- toggle comments
+        --
+
+        function TextEditor:toggleComments()
+            local document = self.document
+            local cursors = self.cursors
+            local comment = CodePoint.decode(self.config.language.singleLineComment or "")
+            if #comment == 0 then
+                return
+            end
+            local transaction = self:startTransaction()
+
+            -- process all cursors
+            for c = 0, cursors:size() - 1 do
+                local cursor = cursors:at(c)
+                local cursorStart = cursor:getSelectionStart()
+                local cursorEnd = cursor:getSelectionEnd()
+
+                -- process all lines in this cursor
+                for line = cursorStart.line, cursorEnd.line do
+                    local glyphs = document:at(line)
+                    if (not cursor:hasSelection() or newDocPos(line, 0) ~= cursorEnd) and #glyphs > 0 then
+                        -- see if line starts with a comment (after possible leading whitespaces)
+                        local start = 0
+                        local i = 0
+                        while start < #glyphs and CodePoint.isWhiteSpace(glyphs[start + 1].codepoint) do
+                            start = start + 1
+                        end
+                        while start + i < #glyphs and i < #comment and glyphs[start + i + 1].codepoint == comment[i + 1] do
+                            i = i + 1
+                        end
+
+                        if i == #comment then
+                            local deleteStart = newDocPos(line, start)
+                            local endOfComment = start + i
+                            if endOfComment < #glyphs - 1 and glyphs[endOfComment + 1].codepoint == 32 then
+                                endOfComment = endOfComment + 1
+                            end
+                            local deleteEnd = newDocPos(line, endOfComment)
+                            self:deleteText(transaction, deleteStart, deleteEnd)
+                            cursors:adjustForDelete(c, deleteStart, deleteEnd, true)
+                        else
+                            local insertStart = newDocPos(line, start)
+                            local insertEnd = self:insertText(transaction, insertStart, self.config.language.singleLineComment .. " ")
+                            cursors:adjustForInsert(c, insertStart, insertEnd, true)
+                        end
+                    end
+                end
+            end
+
+            self:endTransaction(transaction)
+        end
+
+        --
+        -- filters
+        --
+
+        -- [Port] upstream re-runs the filter once per selected line; running it once per selection is equivalent
+        function TextEditor:filterSelections(filter)
+            local cursors = self.cursors
+            local transaction = self:startTransaction()
+
+            -- process all cursors
+            for c = 0, cursors:size() - 1 do
+                local cursor = cursors:at(c)
+                if cursor:hasSelection() then
+                    local s = cursor:getSelectionStart()
+                    local e = cursor:getSelectionEnd()
+
+                    -- get original text and run it through filter
+                    local before = self.document:getSectionText(s, e)
+                    local after = filter(before)
+
+                    -- update selection if anything changed
+                    if after ~= before then
+                        self:deleteText(transaction, s, e)
+                        cursors:adjustForDelete(c, s, e)
+                        local newEnd = self:insertText(transaction, s, after)
+                        cursor:update(s, newEnd)
+                        cursors:adjustForInsert(c, s, newEnd)
+                    end
+                end
+            end
+
+            self:endTransaction(transaction)
+        end
+
+        -- [Port] CodePoint::toLower/toUpper: string.lower/upper only touch ASCII bytes, so UTF-8 stays intact (non-ASCII unchanged)
+        function TextEditor:selectionToLowerCase() self:filterSelections(string.lower) end
+        function TextEditor:selectionToUpperCase() self:filterSelections(string.upper) end
+
+        function TextEditor:stripTrailingWhitespaces()
+            local document = self.document
+            local transaction = self:startTransaction()
+
+            -- process all the lines
+            for i = 0, document:size() - 1 do
+                local line = document:at(i)
+                local lineSize = #line
+                local whitespace = nil
+
+                -- look for first non-whitespace glyph at the end of the line
+                local index = lineSize
+                while index > 0 and CodePoint.isWhiteSpace(line[index].codepoint) do
+                    index = index - 1
+                    whitespace = index
+                end
+
+                -- remove whitespaces (if required)
+                if whitespace then
+                    self:deleteText(transaction, newDocPos(i, whitespace), newDocPos(i, lineSize))
+                end
+            end
+
+            -- update cursor if transaction wasn't empty
+            if self:endTransaction(transaction) then
+                self.cursors:setCursor(self:normalizePos(self.cursors:getCurrent():getSelectionEnd()))
+            end
+        end
+
+        function TextEditor:filterLines(filter)
+            local document = self.document
+            local transaction = self:startTransaction()
+
+            -- process all the lines
+            for i = 0, document:size() - 1 do
+                -- get original text and run it through filter
+                local before = document:getLineText(i)
+                local after = filter(before)
+
+                -- update line if anything changed
+                if after ~= before then
+                    local s = newDocPos(i, 0)
+                    self:deleteText(transaction, s, document:getEndOfLine(s))
+                    self:insertText(transaction, s, after)
+                end
+            end
+
+            -- update cursor if transaction wasn't empty
+            if self:endTransaction(transaction) then
+                self.cursors:setCursor(self:normalizePos(self.cursors:getCurrent():getSelectionEnd()))
+            end
+        end
+
+        function TextEditor:tabsToSpaces()
+            local tabSize = self.config.tabSize
+            self:filterLines(function(input)
+                local output = {}
+                local columns = 0
+                for _, codepoint in utf8.codes(input) do
+                    if codepoint == 9 then
+                        local spaces = tabSize - (columns % tabSize)
+                        output[#output + 1] = string.rep(" ", spaces)
+                        columns = columns + spaces
+                    else
+                        output[#output + 1] = utf8.char(codepoint)
+                        columns = columns + CodePoint.getGlyphWidth(codepoint)
+                    end
+                end
+                return table.concat(output)
+            end)
+        end
+
+        function TextEditor:spacesToTabs()
+            local tabSize = self.config.tabSize
+            self:filterLines(function(input)
+                local output = {}
+                local columns = 0
+                local spaces = 0
+                for _, codepoint in utf8.codes(input) do
+                    if codepoint == 32 then
+                        spaces = spaces + 1
+                    else
+                        while spaces > 0 do
+                            local spacesUntilNextTab = tabSize - (columns % tabSize)
+                            if spacesUntilNextTab == 1 then
+                                output[#output + 1] = " "
+                                columns = columns + 1
+                                spaces = spaces - 1
+                            elseif spaces >= spacesUntilNextTab then
+                                output[#output + 1] = "\t"
+                                columns = columns + spacesUntilNextTab
+                                spaces = spaces - spacesUntilNextTab
+                            elseif codepoint ~= 9 then
+                                output[#output + 1] = string.rep(" ", spaces)
+                                columns = columns + spaces
+                                spaces = 0
+                            else
+                                spaces = 0
+                            end
+                        end
+
+                        if codepoint == 9 then
+                            output[#output + 1] = "\t"
+                            columns = columns + tabSize - (columns % tabSize)
+                        else
+                            output[#output + 1] = utf8.char(codepoint)
+                            columns = columns + CodePoint.getGlyphWidth(codepoint)
+                        end
+                    end
+                end
+                -- [Port] upstream drops trailing spaces here; keep them (stripTrailingWhitespaces is the explicit command)
+                output[#output + 1] = string.rep(" ", spaces)
+                return table.concat(output)
+            end)
+        end
+
+        -- public API
+        function TextEditor:GrowSelections() self:growSelections() end
+        function TextEditor:ShrinkSelections() self:shrinkSelections() end
+        function TextEditor:MoveUpLines() if not self.config.readOnly then self:moveUpLines() end end
+        function TextEditor:MoveDownLines() if not self.config.readOnly then self:moveDownLines() end end
+        function TextEditor:ToggleComments() if not self.config.readOnly and self.config.language then self:toggleComments() end end
+        function TextEditor:SelectionToLowerCase() if not self.config.readOnly then self:selectionToLowerCase() end end
+        function TextEditor:SelectionToUpperCase() if not self.config.readOnly then self:selectionToUpperCase() end end
+        function TextEditor:StripTrailingWhitespaces() if not self.config.readOnly then self:stripTrailingWhitespaces() end end
+        -- filter(text: string) -> string, applied to each selection / each line (UTF-8)
+        function TextEditor:FilterSelections(filter) if not self.config.readOnly then self:filterSelections(filter) end end
+        function TextEditor:FilterLines(filter) if not self.config.readOnly then self:filterLines(filter) end end
+        function TextEditor:TabsToSpaces() if not self.config.readOnly then self:tabsToSpaces() end end
+        function TextEditor:SpacesToTabs() if not self.config.readOnly then self:spacesToTabs() end end
+
+        function TextEditor:SetMiddleMousePanMode() self.config.panMode = true end
+        function TextEditor:SetMiddleMouseScrollMode() self.config.panMode = false end
+        function TextEditor:IsMiddleMousePanMode() return self.config.panMode end
+
+        --
+        -- find/replace
+        --
+
+        function TextEditor:SetFindReplaceEnabled(value)
+            self.config.findReplaceEnabled = value
+            if not value then self:closeFindReplace() end
+        end
+        function TextEditor:IsFindReplaceEnabled() return self.config.findReplaceEnabled end
+        function TextEditor:OpenFindReplaceWindow() if self.config.findReplaceEnabled then self:openFindReplace() end end
+        function TextEditor:CloseFindReplaceWindow() if self.config.findReplaceEnabled then self:closeFindReplace() end end
+        function TextEditor:IsFindReplaceWindowVisible() return self.findReplaceVisible end
+        function TextEditor:HasFindString() return #self.findText > 0 end
+        -- [Port] programmatic access to the find/replace window state
+        function TextEditor:SetFindString(text) self.findText = text end
+        function TextEditor:GetFindString() return self.findText end
+        function TextEditor:SetReplaceString(text) self.replaceText = text end
+        function TextEditor:GetReplaceString() return self.replaceText end
+        function TextEditor:SetFindCaseSensitive(value) self.caseSensitiveFind = value end
+        function TextEditor:SetFindWholeWord(value) self.wholeWordFind = value end
+        function TextEditor:Find() self:find() end
+        function TextEditor:FindNext() self:findNext() end
+        function TextEditor:FindAll() self:findAll() end
+        function TextEditor:Replace() if not self.config.readOnly then self:replace() end end
+        function TextEditor:ReplaceAll() if not self.config.readOnly then self:replaceAll() end end
+
+        -- internationalize find window labels (strings must be UTF-8 encoded)
+        function TextEditor:SetFindButtonLabel(label) self.findButtonLabel = label end
+        function TextEditor:SetFindAllButtonLabel(label) self.findAllButtonLabel = label end
+        function TextEditor:SetReplaceButtonLabel(label) self.replaceButtonLabel = label end
+        function TextEditor:SetReplaceAllButtonLabel(label) self.replaceAllButtonLabel = label end
+
+        local function latchButton(label, value, size)
+            local colors = ImGui.GetStyle().Colors
+            local Col = G.ImGuiCol
+            if value then
+                ImGui.PushStyleColor(Col.Button, colors[Col.ButtonActive])
+                ImGui.PushStyleColor(Col.ButtonHovered, colors[Col.ButtonActive])
+                ImGui.PushStyleColor(Col.ButtonActive, colors[Col.TableBorderLight])
+            else
+                ImGui.PushStyleColor(Col.Button, colors[Col.TableBorderLight])
+                ImGui.PushStyleColor(Col.ButtonHovered, colors[Col.TableBorderLight])
+                ImGui.PushStyleColor(Col.ButtonActive, colors[Col.ButtonActive])
+            end
+            ImGui.Button(label, size)
+            local changed = ImGui.IsItemClicked(0)
+            ImGui.PopStyleColor(3)
+            return changed
+        end
+
+        -- [Port] inputString: InputText edits a fixed byte buffer (no CallbackResize); synced with the string field
+        local inputBufferSize = 256
+        local function inputString(self, label, field, flags)
+            local bufferField = field .. "Buffer"
+            if self[bufferField] == nil or self[field .. "BufferText"] ~= self[field] then
+                self[bufferField] = ImGui.NewTextBuffer(self[field], inputBufferSize)
+            end
+            local changed = ImGui.InputText(label, self[bufferField], inputBufferSize, bor(flags or 0, G.ImGuiInputTextFlags.NoUndoRedo))
+            if changed then
+                self[field] = ImGui.TextBufferToString(self[bufferField])
+            end
+            self[field .. "BufferText"] = self[field]
+            return changed
+        end
+
+        function TextEditor:renderFindReplace()
+            -- render find/replace window (if required)
+            if not self.findReplaceVisible then
+                return
+            end
+
+            -- save current screen position
+            local currentScreenPosition = ImGui.GetCursorScreenPos()
+            local readOnly = self.config.readOnly
+
+            -- calculate sizes
+            ImGui.PushStyleVar(G.ImGuiStyleVar.ItemSpacing, ImVec2(6.0, 4.0))
+            local style = ImGui.GetStyle()
+            local spacingX, spacingY = style.ItemSpacing.x, style.ItemSpacing.y
+            local fieldWidth = 250.0 * (style.FontScaleDpi or 1.0)
+
+            local button1Width = ImGui.CalcTextSize(self.findButtonLabel).x + spacingX * 2.0
+            local button2Width = ImGui.CalcTextSize(self.findAllButtonLabel).x + spacingX * 2.0
+            local optionWidth = ImGui.CalcTextSize("Aa").x + spacingX * 2.0
+
+            local windowHeight = style.ChildBorderSize * 2.0 + style.WindowPadding.y * 2.0 + ImGui.GetFrameHeight()
+            if not readOnly then
+                button1Width = math.max(button1Width, ImGui.CalcTextSize(self.replaceButtonLabel).x + spacingX * 2.0)
+                button2Width = math.max(button2Width, ImGui.CalcTextSize(self.replaceAllButtonLabel).x + spacingX * 2.0)
+                windowHeight = windowHeight + spacingY + ImGui.GetFrameHeight()
+            end
+
+            local windowWidth = style.ChildBorderSize * 2.0 + style.WindowPadding.x * 2.0
+                + fieldWidth + spacingX + button1Width + spacingX + button2Width + spacingX
+                + optionWidth * 3.0 + spacingX * 2.0
+
+            -- create window
+            local availableSpace = ImGui.GetWindowWidth()
+            if ImGui.GetCurrentWindow().ScrollbarY then
+                availableSpace = availableSpace - style.ScrollbarSize
+            end
+
+            local windowPos = ImGui.GetWindowPos()
+            ImGui.SetNextWindowPos(ImVec2(windowPos.x + availableSpace - windowWidth - spacingX, windowPos.y + spacingY * 2.0))
+            ImGui.SetNextWindowSize(ImVec2(windowWidth, windowHeight))
+            ImGui.SetNextWindowBgAlpha(0.75)
+
+            ImGui.BeginChild("find-replace", ImVec2(windowWidth, windowHeight), G.ImGuiChildFlags.Borders)
+            ImGui.SetNextItemWidth(fieldWidth)
+
+            if self.focusOnFind then
+                ImGui.SetKeyboardFocusHere()
+                self.focusOnFind = false
+            end
+
+            if inputString(self, "###find", "findText", G.ImGuiInputTextFlags.AutoSelectAll) then
+                if #self.findText > 0 then
+                    self:selectFirstOccurrenceOf(self.findText, self.caseSensitiveFind, self.wholeWordFind)
+                else
+                    self.cursors:clearAll()
+                end
+            end
+
+            if ImGui.IsItemDeactivated() then
+                if ImGui.IsKeyPressed(Key.Escape) then
+                    self:closeFindReplace()
+                elseif ImGui.IsKeyPressed(Key.Enter) or ImGui.IsKeyPressed(Key.KeypadEnter) then
+                    self.focusOnEditor = true
+                    self.focusOnFind = false
+                end
+            end
+
+            local disableFindButtons = #self.findText == 0
+            if disableFindButtons then ImGui.BeginDisabled() end
+
+            ImGui.SameLine()
+            if ImGui.Button(self.findButtonLabel, ImVec2(button1Width, 0.0)) then self:find() end
+            ImGui.SameLine()
+            if ImGui.Button(self.findAllButtonLabel, ImVec2(button2Width, 0.0)) then self:findAll() end
+
+            if disableFindButtons then ImGui.EndDisabled() end
+
+            ImGui.SameLine()
+            if latchButton("Aa", self.caseSensitiveFind, ImVec2(optionWidth, 0.0)) then
+                self.caseSensitiveFind = not self.caseSensitiveFind
+                self:find()
+            end
+
+            ImGui.SameLine()
+            if latchButton("[]", self.wholeWordFind, ImVec2(optionWidth, 0.0)) then
+                self.wholeWordFind = not self.wholeWordFind
+                self:find()
+            end
+
+            ImGui.SameLine()
+            if ImGui.Button("x", ImVec2(optionWidth, 0.0)) then self:closeFindReplace() end
+
+            if not readOnly then
+                ImGui.SetNextItemWidth(fieldWidth)
+                inputString(self, "###replace", "replaceText")
+                ImGui.SameLine()
+
+                local disableReplaceButtons = #self.findText == 0 or #self.replaceText == 0
+                if disableReplaceButtons then ImGui.BeginDisabled() end
+
+                if ImGui.Button(self.replaceButtonLabel, ImVec2(button1Width, 0.0)) then self:replace() end
+                ImGui.SameLine()
+                if ImGui.Button(self.replaceAllButtonLabel, ImVec2(button2Width, 0.0)) then self:replaceAll() end
+
+                if disableReplaceButtons then ImGui.EndDisabled() end
+            end
+
+            if ImGui.IsWindowFocused() and not disableFindButtons and ImGui.IsKeyChordPressed(bor(Mod_Ctrl, Key.G)) then
+                ImGui.SetWindowFocus(nil)
+                self:find()
+            end
+
+            ImGui.EndChild()
+            ImGui.PopStyleVar()
+            ImGui.SetCursorScreenPos(currentScreenPosition)
+        end
+
+        function TextEditor:openFindReplace()
+            -- get main cursor location
+            local cursor = self.cursors:getMain()
+
+            -- see if we have a current selection that's on one line
+            if cursor:hasSelection() then
+                if cursor:getSelectionStart().line == cursor:getSelectionEnd().line then
+                    -- use it as the default search
+                    self.findText = self.document:getSectionText(cursor:getSelectionStart(), cursor:getSelectionEnd())
+                end
+            else
+                -- if cursor is inside a "real" word, use that as the default
+                local selection = self.document:getWholeWord(cursor:getSelectionStart(), true)
+                if selection.start ~= selection["end"] then
+                    self.findText = self.document:getSectionText(selection.start, selection["end"])
+                end
+            end
+
+            self.findReplaceVisible = true
+            self.focusOnFind = true
+        end
+
+        function TextEditor:closeFindReplace()
+            if self.findReplaceVisible then
+                self.findReplaceVisible = false
+                self.focusOnEditor = true
+                self.focusOnFind = false
+            end
+        end
+
+        function TextEditor:find()
+            if #self.findText > 0 then
+                self:selectNextOccurrenceOf(self.findText, self.caseSensitiveFind, self.wholeWordFind)
+                self.focusOnEditor = true
+                self.focusOnFind = false
+            end
+        end
+
+        function TextEditor:findNext() self:find() end
+
+        function TextEditor:findAll()
+            if #self.findText > 0 then
+                self:selectAllOccurrencesOf(self.findText, self.caseSensitiveFind, self.wholeWordFind)
+                self.focusOnEditor = true
+                self.focusOnFind = false
+            end
+        end
+
+        function TextEditor:replace()
+            if #self.findText > 0 then
+                if not self.cursors:anyHasSelection() then
+                    self:selectNextOccurrenceOf(self.findText, self.caseSensitiveFind, self.wholeWordFind)
+                end
+                self:replaceTextInCurrentCursor(self.replaceText)
+                self:selectNextOccurrenceOf(self.findText, self.caseSensitiveFind, self.wholeWordFind)
+                self.focusOnEditor = true
+                self.focusOnFind = false
+            end
+        end
+
+        function TextEditor:replaceAll()
+            if #self.findText > 0 then
+                self:selectAllOccurrencesOf(self.findText, self.caseSensitiveFind, self.wholeWordFind)
+                self:replaceTextInAllCursors(self.replaceText)
+                self.focusOnEditor = true
+                self.focusOnFind = false
+            end
+        end
     end
 
     return TextEditor
