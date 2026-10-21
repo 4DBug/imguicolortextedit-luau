@@ -142,6 +142,7 @@ return function(G)
     end
 
     -- [Port] no east asian width tables: every glyph is one column wide
+
     function CodePoint.getGlyphWidth(codepoint)
         return 1
     end
@@ -161,7 +162,7 @@ return function(G)
     end
 
     function Document.new()
-        local self = setmetatable({ lines = {}, updated = false }, Document)
+        local self = setmetatable({ lines = {}, updated = false, version = 0 }, Document)
         self:appendLine()
         return self
     end
@@ -223,6 +224,7 @@ return function(G)
 
         -- [Port] updateIndents skipped (used by rendering only)
         self.updated = true
+        self.version = self.version + 1
     end
 
     -- insert/delete part of the document's text (strings are UTF-8 encoded)
@@ -264,10 +266,13 @@ return function(G)
 
         -- mark affected lines as changed
         for j = start.line, e.line do
-            self:at(j).needsColorizing = true
+            local changed = self:at(j)
+            changed.needsColorizing = true
+            changed.columns = nil
         end
 
         self.updated = true
+        self.version = self.version + 1
         return e
     end
 
@@ -298,7 +303,9 @@ return function(G)
 
         -- mark line and document as changed
         startLine.needsColorizing = true
+        startLine.columns = nil
         self.updated = true
+        self.version = self.version + 1
     end
 
     -- get document text as UTF-8
@@ -318,7 +325,20 @@ return function(G)
     end
 
     -- get part of document text (returned strings are UTF-8 encoded)
+    -- [Port] the last result is kept until the document changes (version) or another section is asked for: the editor
+    --   hands the selected text to the platform (IME / Roblox text proxy) every frame
     function Document:getSectionText(start, e)
+        local memo = self.sectionMemo
+        if memo and memo[1] == self.version and memo[2] == start.line and memo[3] == start.index and memo[4] == e.line and memo[5] == e.index then
+            return memo[6]
+        end
+        local text = self:getSectionTextUncached(start, e)
+        if not memo then memo = {}; self.sectionMemo = memo end
+        memo[1], memo[2], memo[3], memo[4], memo[5], memo[6] = self.version, start.line, start.index, e.line, e.index, text
+        return text
+    end
+
+    function Document:getSectionTextUncached(start, e)
         local parts = {}
         local lineNo = start.line
         local index = start.index
@@ -1644,6 +1664,7 @@ return function(G)
     local bracketColors = { Color.matchingBracketLevel1, Color.matchingBracketLevel2, Color.matchingBracketLevel3 }
 
     -- [Port] invisible (indentation based) blocks are not generated yet (no language uses indentationForBlocks)
+
     function Bracketeer:update(config, document)
         -- see if the configuration changed
         local configChanged = self.showMatchingBrackets ~= config.showMatchingBrackets or self.language ~= config.language
@@ -1671,10 +1692,12 @@ return function(G)
             local level = 0
 
             -- process all the glyphs
+            -- [Port] the (disjoint) opener/closer lookups come before the colour test: most glyphs are neither
             for l, line in __iter(ipairs(document.lines)) do
                 for i, glyph in __iter(ipairs(line)) do
+                    local codepoint = glyph.codepoint
                     -- handle a "bracket opener" that is not in a comment, string or preprocessor statement
-                    if isBracketCandidate(glyph) and openers[glyph.codepoint] then
+                    if openers[codepoint] and isBracketCandidate(glyph) then
                         -- start a new level
                         list[#list + 1] = { startChar = glyph.codepoint, start = newDocPos(l - 1, i - 1), endChar = 0, ["end"] = newDocPos(0, 0), level = level, visible = true }
                         levels[#levels + 1] = #list
@@ -1682,7 +1705,7 @@ return function(G)
                         level = level + 1
 
                     -- handle a "bracket closer" that is not in a comment, string or preprocessor statement
-                    elseif isBracketCandidate(glyph) and closers[glyph.codepoint] then
+                    elseif closers[codepoint] and isBracketCandidate(glyph) then
                         if #levels > 0 then
                             local lastBracket = list[table.remove(levels)]
                             level = level - 1
@@ -2019,12 +2042,14 @@ return function(G)
         self.bracketeer:resetUpdated()
 
         -- get "new" total editor size in pixels
-        -- ponytail: column count rescans every line each call, cache per line if huge documents get slow
-        local columns = 0
+        -- [Port] the widest line is looked for only when the document (or tab size) changed (every edit goes through
+        --   Document:setUtf8Text/insertText/deleteText, which set document.updated), using the column count cached on
+        --   each line (cleared by insertText/deleteText on the lines they change; new lines have none)
         local tabSize = self.config.tabSize
-        for _, line in __iter(ipairs(self.document.lines)) do
-            local c = self.lineColumns(line, tabSize)
-            if c > columns then columns = c end
+        local columns = self.maxColumns
+        if documentChanged or columns == nil or self.maxColumnsDocument ~= self.document or self.maxColumnsTabSize ~= tabSize then
+            columns = self.maxLineColumns(self.document.lines, tabSize)
+            self.maxColumns, self.maxColumnsDocument, self.maxColumnsTabSize = columns, self.document, tabSize
         end
         local width = self.textLeftOffset + columns * self.glyphSize.x + self.cursorWidth
         local height = self.document:size() * self.glyphSize.y
@@ -2209,6 +2234,23 @@ return function(G)
             return column
         end
 
+        -- [Port] widest line in columns, through the per-line cache (line.columns for line.columnsTabSize)
+
+        function TextEditor.maxLineColumns(lines, tabSize)
+            local lineColumns = TextEditor.lineColumns
+            local columns = 0
+            for l = 1, #lines do
+                local line = lines[l]
+                local c = line.columns
+                if c == nil or line.columnsTabSize ~= tabSize then
+                    c = lineColumns(line, tabSize)
+                    line.columns, line.columnsTabSize = c, tabSize
+                end
+                if c > columns then columns = c end
+            end
+            return columns
+        end
+
         local function isPairOpener(ch) return ch == 123 or ch == 91 or ch == 40 or ch == 39 or ch == 34 end
         local function toPairCloser(ch)
             if ch == 123 then return 125 elseif ch == 91 then return 93 elseif ch == 40 then return 41 end
@@ -2216,6 +2258,7 @@ return function(G)
         end
 
         -- coordinate conversions
+
         function TextEditor:docPos2VisPos(pos)
             local line = self.document:at(pos.line)
             local tabSize = self.config.tabSize
@@ -2635,6 +2678,7 @@ return function(G)
             local rowY = self.cursorScreenPos.y + self.firstVisibleRow * glyphSize.y
             local firstRenderableColumn = math.floor(self.firstVisibleColumn / tabSize) * tabSize
             local lastVisibleColumn = self.lastVisibleColumn
+            local charPos = ImVec2(0, 0) -- [Port] scratch glyph position (RenderChar only reads it)
 
             -- only process all visible rows
             for i = self.firstVisibleRow, self.lastVisibleRow do
@@ -2669,7 +2713,8 @@ return function(G)
 
                     -- handle regular glyphs
                     elseif column >= firstRenderableColumn then
-                        font:RenderChar(drawList, fontSize, ImVec2(glyphX, rowY), palette[glyph.color], codepoint)
+                        charPos.x, charPos.y = glyphX, rowY
+                        font:RenderChar(drawList, fontSize, charPos, palette[glyph.color], codepoint)
                     end
 
                     column = column + width
